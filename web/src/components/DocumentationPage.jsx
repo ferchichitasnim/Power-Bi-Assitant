@@ -4,7 +4,9 @@ import { useState, useCallback } from "react";
 import { Check, Copy, FileText } from "lucide-react";
 import Header from "./Header";
 import EmptyFileState from "./shared/EmptyFileState";
+import GeneratePdfButton from "./GeneratePdfButton";
 import { usePBIX } from "../context/PBIXContext";
+import { enrichSourceLabels } from "../utils/sourceDetection";
 
 /* ------------------------------------------------------------------ */
 /*  Copy button — reusable, shows checkmark briefly after copy        */
@@ -84,10 +86,11 @@ function StatCard({ label, value }) {
 /*  List card                                                         */
 /* ------------------------------------------------------------------ */
 function ListCard({ title, items, emptyText }) {
+  const visibleItems = (items || []).filter((item) => !isInternalPowerBITableName(String(item)));
   return (
     <div className="card" style={{ padding: 16 }}>
       <div style={{ fontWeight: 700, marginBottom: 10, fontSize: 15 }}>{title}</div>
-      {items.length === 0 ? (
+      {visibleItems.length === 0 ? (
         <div className="muted">{emptyText}</div>
       ) : (
         <div
@@ -101,7 +104,7 @@ function ListCard({ title, items, emptyText }) {
           }}
         >
           <ul style={{ margin: 0, paddingLeft: 18, display: "grid", gap: 8 }}>
-            {items.map((item, idx) => (
+            {visibleItems.map((item, idx) => (
               <li key={`${idx}-${item}`} style={{ lineHeight: 1.35 }}>
                 {item}
               </li>
@@ -117,8 +120,18 @@ function ListCard({ title, items, emptyText }) {
 /*  Helper: build plain-text for a single section                     */
 /* ------------------------------------------------------------------ */
 function buildSectionText(title, items) {
-  if (!items || items.length === 0) return `${title}\n  (empty)`;
-  return `${title}\n${items.map((i) => `  • ${i}`).join("\n")}`;
+  const visibleItems = (items || []).filter((i) => !isInternalPowerBITableName(String(i)));
+  if (visibleItems.length === 0) return `${title}\n  (empty)`;
+  return `${title}\n${visibleItems.map((i) => `  • ${i}`).join("\n")}`;
+}
+
+function isInternalPowerBITableName(name) {
+  const v = String(name || "").toLowerCase();
+  return v.includes("localdatatable_") || v.includes("datetabletemplate_");
+}
+
+function filterInternalPowerBITables(items) {
+  return (items || []).filter((name) => !isInternalPowerBITableName(name));
 }
 
 /* ------------------------------------------------------------------ */
@@ -133,13 +146,12 @@ function buildFullDocText({
   measureDocs,
   rls,
   parameters,
-  reportSources,
-  sources,
+  sourceList,
 }) {
   const lines = [];
 
   lines.push("=== REPORT DATA SOURCES ===");
-  const srcList = reportSources.sources && reportSources.sources.length ? reportSources.sources : sources;
+  const srcList = sourceList || [];
   if (srcList.length) srcList.forEach((s) => lines.push(`  • ${s}`));
   else lines.push("  No sources detected.");
 
@@ -174,23 +186,25 @@ function buildFullDocText({
   if (measureDocs.length) measureDocs.forEach((m) => lines.push(`  • ${m.reference}${m.formula ? ` = ${m.formula}` : ""}`));
   else lines.push("  No DAX measures.");
 
-  lines.push("");
-  lines.push("=== RLS ===");
-  lines.push(`  RLS Present: ${rls.has_rls ? "Yes" : "Not detected"}`);
-  if (rls.details && rls.details.length) rls.details.forEach((d) => lines.push(`  • ${d}`));
+  const hasRls = Boolean(rls?.has_rls) || (Array.isArray(rls?.details) && rls.details.length > 0);
+  if (hasRls) {
+    lines.push("");
+    lines.push("=== RLS ===");
+    lines.push(`  RLS Present: ${rls.has_rls ? "Yes" : "Not detected"}`);
+    if (rls.details && rls.details.length) rls.details.forEach((d) => lines.push(`  • ${d}`));
+  }
 
-  lines.push("");
-  lines.push("=== PARAMETERS ===");
-  if (parameters.length) {
-    parameters.forEach((p) =>
+  const paramList = parameters || [];
+  if (paramList.length) {
+    lines.push("");
+    lines.push("=== PARAMETERS ===");
+    paramList.forEach((p) =>
       lines.push(
         `  • ${p.name}${p.type ? ` (${p.type})` : ""}${p.current_value ? ` = ${p.current_value}` : ""}${
           p.is_required ? " [Required]" : ""
         }`
       )
     );
-  } else {
-    lines.push("  No parameters detected.");
   }
 
   return lines.join("\n");
@@ -200,7 +214,7 @@ function buildFullDocText({
 /*  Main component                                                    */
 /* ------------------------------------------------------------------ */
 export default function DocumentationPage() {
-  const { pbixContext } = usePBIX();
+  const { pbixContext, fileName } = usePBIX();
 
   if (!pbixContext) {
     return (
@@ -226,7 +240,8 @@ export default function DocumentationPage() {
   const securityAndParameters = documentation.security_and_parameters || {};
   const dataModel = documentation.data_model || {};
 
-  const docTables = reportModel.tables && reportModel.tables.length ? reportModel.tables : tables;
+  const rawDocTables = reportModel.tables && reportModel.tables.length ? reportModel.tables : tables;
+  const docTables = filterInternalPowerBITables(rawDocTables);
   const modelRelationships = reportModel.relationships || [];
   const daxColumns = daxCalculations.calculated_columns || [];
   const measureDocs = daxCalculations.measures || [];
@@ -235,8 +250,10 @@ export default function DocumentationPage() {
   const tableRoles = dataModel.table_roles || [];
   const keyColumns = dataModel.key_columns || [];
 
-  // Pre-build text arrays for display + copy
-  const srcItems = reportSources.sources && reportSources.sources.length ? reportSources.sources : sources;
+  const powerQuery = documentation.power_query || pbixContext.power_query || [];
+  const rawSrcItems =
+    reportSources.sources && reportSources.sources.length ? reportSources.sources : sources;
+  const srcItems = enrichSourceLabels(rawSrcItems, powerQuery);
   const relItems = modelRelationships.map((r) => {
     const tag = r.active === false ? " [INACTIVE]" : "";
     return `${r.from} → ${r.to} | cardinality: ${r.cardinality} | direction: ${r.direction}${tag}`;
@@ -251,6 +268,23 @@ export default function DocumentationPage() {
         p.is_required ? " [Required]" : ""
       }`
   );
+  const hasRlsContent = Boolean(rls.has_rls) || (Array.isArray(rls.details) && rls.details.length > 0);
+  const hasParametersContent = paramItems.length > 0;
+  const showSecuritySection = hasRlsContent || hasParametersContent;
+  const securitySectionTitle =
+    hasRlsContent && hasParametersContent
+      ? "RLS and Parameters"
+      : hasRlsContent
+        ? "RLS"
+        : "Parameters";
+  const securityCopyText = [
+    hasRlsContent &&
+      `RLS\n  RLS Present: ${rls.has_rls ? "Yes" : "Not detected"}` +
+        (rls.details?.length ? "\n" + rls.details.map((d) => `  • ${d}`).join("\n") : ""),
+    hasParametersContent && buildSectionText("Parameters", paramItems),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   const fullDocText = buildFullDocText({
     docTables,
@@ -261,9 +295,23 @@ export default function DocumentationPage() {
     measureDocs,
     rls,
     parameters,
-    reportSources,
-    sources,
+    sourceList: srcItems,
   });
+
+  const documentationPdfPayload = {
+    filename: fileName || "PowerBI_Report.pbix",
+    sources: srcItems,
+    tables: docTables,
+    columns: pbixContext.columns || {},
+    schema: documentation.model_schema || [],
+    power_query: documentation.power_query || pbixContext.power_query || [],
+    relationships: modelRelationships,
+    measures: measureDocs,
+    calculated_columns: daxColumns,
+    rls: securityAndParameters.rls_raw || rls,
+    table_roles: tableRoles,
+    parameters,
+  };
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
@@ -273,13 +321,14 @@ export default function DocumentationPage() {
         icon={<FileText size={24} color="var(--pbi-primary)" />}
       />
 
-      {/* Copy All button */}
-      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+      {/* Copy + Generate */}
+      <div style={{ display: "grid", gap: 10, justifyItems: "end" }}>
         <CopyButton
           text={fullDocText}
           label="Copy All Documentation"
           style={{ padding: "8px 16px", fontSize: 13 }}
         />
+        <GeneratePdfButton payload={documentationPdfPayload} disabled={!pbixContext} />
       </div>
 
       <div style={{ display: "grid", gap: 16 }}>
@@ -345,31 +394,27 @@ export default function DocumentationPage() {
         </div>
 
         {/* ---------------- RLS & Parameters ---------------- */}
-        <div className="card" style={{ padding: 16 }}>
-          <SectionHeader
-            title="RLS and Parameters"
-            copyText={
-              `RLS\n  RLS Present: ${rls.has_rls ? "Yes" : "Not detected"}` +
-              (rls.details && rls.details.length ? "\n" + rls.details.map((d) => `  • ${d}`).join("\n") : "") +
-              "\n\n" +
-              buildSectionText("Parameters", paramItems)
-            }
-          />
-          <div className="section-grid">
-            <div className="card" style={{ padding: 12, background: "var(--pbi-surface-alt)" }}>
-              <div style={{ fontWeight: 700, marginBottom: 6 }}>RLS</div>
-              <div className="muted">RLS Present: {rls.has_rls ? "Yes" : "Not detected"}</div>
-              {rls.details && rls.details.length > 0 && (
-                <ul style={{ margin: "8px 0 0", paddingLeft: 18 }}>
-                  {rls.details.map((d, idx) => (
-                    <li key={`${idx}-${d}`}>{d}</li>
-                  ))}
-                </ul>
+        {showSecuritySection && (
+          <div className="card" style={{ padding: 16 }}>
+            <SectionHeader title={securitySectionTitle} copyText={securityCopyText} />
+            <div className={hasRlsContent && hasParametersContent ? "section-grid" : undefined}>
+              {hasRlsContent && (
+                <div className="card" style={{ padding: 12, background: "var(--pbi-surface-alt)" }}>
+                  <div style={{ fontWeight: 700, marginBottom: 6 }}>RLS</div>
+                  <div className="muted">RLS Present: {rls.has_rls ? "Yes" : "Not detected"}</div>
+                  {rls.details && rls.details.length > 0 && (
+                    <ul style={{ margin: "8px 0 0", paddingLeft: 18 }}>
+                      {rls.details.map((d, idx) => (
+                        <li key={`${idx}-${d}`}>{d}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
               )}
+              {hasParametersContent && <ListCard title="Parameters" items={paramItems} />}
             </div>
-            <ListCard title="Parameters" items={paramItems} emptyText="No parameters detected." />
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

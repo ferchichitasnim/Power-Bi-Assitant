@@ -38,6 +38,9 @@ Thumbs.db
 # Claude Desktop Config
 claude_desktop_config.json
 
+# Uploaded PBIX staging (patch-measures)
+src/tmp/
+
 # otros
 informe_mercado.pbix
 *.code-workspace

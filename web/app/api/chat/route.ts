@@ -40,6 +40,7 @@ export async function POST(req: Request) {
       columns?: Record<string, string[]>;
       measures?: string[];
       relationships?: string[];
+      modelTables?: { name: string; columns: string[]; measures: string[] }[];
     };
     daxContext?: string;
     mode?: string;

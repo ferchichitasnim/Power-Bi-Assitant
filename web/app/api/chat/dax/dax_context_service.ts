@@ -17,13 +17,25 @@ function quoteRef(table: string, column: string) {
   return `'${table}'[${column}]`;
 }
 
+function bareColumnRef(table: string, column: string) {
+  return `${table.toLowerCase()}[${column.toLowerCase()}]`;
+}
+
 export function buildReducedDaxContext(model: SemanticModelContext): ReducedDaxContext {
   const tables: ReducedTable[] = [];
   const tableMap: Record<string, ReducedTable> = {};
   const allColumnRefs = new Set<string>();
 
-  for (const table of model.tables) {
-    const cols = model.columns[table] || [];
+  const tableNames =
+    model.modelTables && model.modelTables.length > 0
+      ? model.modelTables.map((t) => t.name)
+      : model.tables;
+
+  for (const table of tableNames) {
+    const fromModelTable = model.modelTables?.find((t) => t.name === table);
+    const cols = fromModelTable?.columns?.length
+      ? fromModelTable.columns
+      : model.columns[table] || [];
     const reduced: ReducedTable = {
       name: table,
       columns: cols,
@@ -33,7 +45,10 @@ export function buildReducedDaxContext(model: SemanticModelContext): ReducedDaxC
     };
     tables.push(reduced);
     tableMap[table.toLowerCase()] = reduced;
-    for (const col of cols) allColumnRefs.add(quoteRef(table, col).toLowerCase());
+    for (const col of cols) {
+      allColumnRefs.add(quoteRef(table, col).toLowerCase());
+      allColumnRefs.add(bareColumnRef(table, col));
+    }
   }
 
   const factTables = tables

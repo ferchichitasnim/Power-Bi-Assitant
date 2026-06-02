@@ -13,7 +13,9 @@ export default function GlobalFileBar() {
     isLoading,
     error,
     uploadProgress,
+    isOpeningDesktop,
     uploadFile,
+    openInPowerBIDesktop,
     clearFile,
     setError,
   } = usePBIX();
@@ -145,49 +147,60 @@ export default function GlobalFileBar() {
             <motion.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              style={{ display: "flex", alignItems: "center", gap: 10 }}
+              style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}
             >
-              <span
-                style={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: 999,
-                  background: "var(--pbi-success)",
-                  boxShadow: "0 0 8px rgba(0, 178, 148, 0.6)",
-                }}
-              />
-              <span className="muted" style={{ fontSize: 12 }}>
-                {fileSize}
-              </span>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: 999,
+                    background: "var(--pbi-success)",
+                    boxShadow: "0 0 8px rgba(0, 178, 148, 0.6)",
+                  }}
+                />
+                <span className="muted" style={{ fontSize: 12 }}>
+                  {fileSize}
+                </span>
+                <button
+                  type="button"
+                  className="input"
+                  style={{ padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}
+                  onClick={onPick}
+                >
+                  Change File
+                </button>
+                <button
+                  type="button"
+                  aria-label="Clear file"
+                  onClick={() => {
+                    clearFile();
+                    setError(null);
+                  }}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    width: 36,
+                    height: 36,
+                    borderRadius: 8,
+                    border: "1px solid var(--pbi-border)",
+                    background: "var(--pbi-surface-alt)",
+                    color: "var(--pbi-muted)",
+                    cursor: "pointer",
+                  }}
+                >
+                  <X size={18} />
+                </button>
+              </div>
               <button
                 type="button"
-                className="input"
-                style={{ padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}
-                onClick={onPick}
+                className="button"
+                onClick={openInPowerBIDesktop}
+                disabled={isOpeningDesktop}
+                style={{ padding: "8px 12px", fontSize: 12, height: "auto", minWidth: 220 }}
               >
-                Change File
-              </button>
-              <button
-                type="button"
-                aria-label="Clear file"
-                onClick={() => {
-                  clearFile();
-                  setError(null);
-                }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  width: 36,
-                  height: 36,
-                  borderRadius: 8,
-                  border: "1px solid var(--pbi-border)",
-                  background: "var(--pbi-surface-alt)",
-                  color: "var(--pbi-muted)",
-                  cursor: "pointer",
-                }}
-              >
-                <X size={18} />
+                {isOpeningDesktop ? "Opening Power BI Desktop..." : "Open this PBIX in Power BI Desktop"}
               </button>
             </motion.div>
           )}

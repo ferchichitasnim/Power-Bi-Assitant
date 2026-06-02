@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import asyncio
 import ast
+import base64
 import json
 import logging
 import os
+import queue
 import re
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -14,7 +17,10 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
 from typing import Any, Iterator
+
+import requests
 
 logger = logging.getLogger(__name__)
 if not logger.handlers and not logging.root.handlers:
@@ -75,17 +81,61 @@ def _friendly_ollama_error(exc: Exception, base_url: str, model: str | None = No
     if "timed out" in lowered:
         return f"Ollama request timed out at {base_url}. Try again or use a smaller model."
 
+    if isinstance(exc, urllib.error.HTTPError):
+        detail = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw) if raw.strip().startswith("{") else {}
+            detail = str(parsed.get("error") or raw).strip()
+        except Exception:
+            detail = ""
+        if detail:
+            lowered_detail = detail.lower()
+            if "unable to allocate" in lowered_detail or "out of memory" in lowered_detail:
+                return (
+                    f"Ollama ran out of memory loading model `{model or 'selected model'}`. "
+                    "Close other apps, restart Ollama (`ollama serve`), try a smaller model "
+                    "(e.g. llama3.2:1b), or reduce story context size."
+                )
+            return f"Ollama error ({exc.code}): {detail[:400]}"
+
     return f"Ollama request failed at {base_url}: {original}"
 
 
-from flask import Flask, Response, jsonify, redirect, render_template, request, stream_with_context
+from flask import (
+    Flask,
+    Response,
+    after_this_request,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    stream_with_context,
+)
 from flask_cors import CORS
 from mcp import StdioServerParameters
 from mcp.client.session import ClientSession
 from mcp.client.stdio import stdio_client
-from storytelling.ollama_story import build_story_context
+from pbixray import PBIXRay
+from pbix_patcher import PBIXPatcher, PBIXPatcherError
+from pbix_upload_store import cleanup_old_uploads, get_upload, register_upload, upload_dir
+from documentation_pdf import (
+    assemble_reportlab_document,
+    build_deterministic_enrichment,
+    enrich_documentation_json,
+    enrich_source_labels,
+    prepare_pdf_context,
+)
+from documentation_reportlab import build_reportlab_pdf
+from storytelling.ollama_story import (
+    build_story_context,
+    compact_story_context_for_prompt,
+    focus_matches_context,
+)
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB request limit
 CORS(
     app,
     resources={
@@ -97,10 +147,25 @@ CORS(
                 "http://localhost:3001",
                 "http://127.0.0.1:3002",
                 "http://localhost:3002",
+            ],
+            "expose_headers": ["X-Patch-Method", "Content-Disposition"],
+        },
+        r"/documentation/*": {
+            "origins": [
+                "http://127.0.0.1:3000",
+                "http://localhost:3000",
+                "http://127.0.0.1:3001",
+                "http://localhost:3001",
+                "http://127.0.0.1:3002",
+                "http://localhost:3002",
             ]
         }
     },
 )
+
+_DOC_CONTEXT_CACHE: dict[str, dict[str, Any]] = {}
+_DOC_CONTEXT_LAST_KEY = "__last__"
+_DOC_CACHE_MAX_ITEMS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +417,51 @@ def _coerce_tables(value: Any) -> list[str]:
     return []
 
 
+def _is_internal_powerbi_table(table_name: str) -> bool:
+    """
+    Filter internal auto-generated Power BI helper tables from user-facing docs.
+    These are not real business model tables and should not be counted/displayed.
+    """
+    name = str(table_name or "").strip()
+    if not name:
+        return False
+    lower = name.lower().lstrip(" '\"`[$")
+    return "localdatetable_" in lower or "datetabletemplate_" in lower
+
+
+def _filter_table_names(tables: list[str]) -> list[str]:
+    return [t for t in tables if not _is_internal_powerbi_table(t)]
+
+
+def _filter_rows_by_table_name(
+    rows: Any,
+    table_keys: tuple[str, ...],
+    *,
+    drop_none: bool = False,
+) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        should_skip = False
+        for key in table_keys:
+            table_name = str(row.get(key) or "").strip()
+            # Skip internal Power BI tables
+            if table_name and _is_internal_powerbi_table(table_name):
+                should_skip = True
+                break
+            # Skip rows where table name is None/empty (PBIXRay stores None
+            # when the target is an internal auto-generated table)
+            if drop_none and (not table_name or table_name.lower() == "none"):
+                should_skip = True
+                break
+        if not should_skip:
+            out.append(row)
+    return out
+
+
 def _mcp_measure_names(measures_rows: Any) -> list[str]:
     if not isinstance(measures_rows, list):
         return []
@@ -389,6 +499,15 @@ def _mcp_relationship_lines(relationships_rows: Any) -> list[str]:
 
 
 def _extract_sources_from_rows(power_query_rows: Any, metadata_rows: Any) -> list[str]:
+    """Heuristic extraction of data-source hints from Power Query (M) text.
+
+    PBIXRay exposes each query's M ``Expression`` as a string. We do not execute M;
+    we scan for common connector function calls (Sql.Database, Web.Contents, etc.)
+    and optional model metadata rows whose names look like connection fields.
+
+    Dynamic M (variables built outside string literals) may not match; results are
+    best-effort labels for documentation, not a full lineage engine.
+    """
     sources: set[str] = set()
     if isinstance(power_query_rows, list):
         for row in power_query_rows:
@@ -397,18 +516,41 @@ def _extract_sources_from_rows(power_query_rows: Any, metadata_rows: Any) -> lis
             expr = str(row.get("Expression") or "")
             if not expr:
                 continue
+            # Regexes over literal strings inside M. Order: specific multi-arg first.
             patterns = [
+                # SQL / cloud SQL
                 r'Sql\.Database\(\s*"([^"]+)"\s*,\s*"([^"]+)"',
+                r'Sql\.Databases\(\s*"([^"]+)"',
+                r'AzureSQL\.Database\(\s*"([^"]+)"\s*,\s*"([^"]+)"',
+                r'AnalysisServices\.Database\(\s*"([^"]+)"\s*,\s*"([^"]+)"',
+                # Other databases
                 r'Oracle\.Database\(\s*"([^"]+)"',
                 r'Snowflake\.Databases\(\s*"([^"]+)"',
                 r'PostgreSQL\.Database\(\s*"([^"]+)"\s*,\s*"([^"]+)"',
                 r'MySQL\.Database\(\s*"([^"]+)"\s*,\s*"([^"]+)"',
+                r'Db2\.Database\(\s*"([^"]+)"\s*,\s*"([^"]+)"',
+                r'Teradata\.Database\(\s*"([^"]+)"\s*,\s*"([^"]+)"',
+                # Files & folders
                 r'Excel\.Workbook\(\s*File\.Contents\(\s*"([^"]+)"',
                 r'Csv\.Document\(\s*File\.Contents\(\s*"([^"]+)"',
+                r'Parquet\.Document\(\s*File\.Contents\(\s*"([^"]+)"',
+                r'Json\.Document\(\s*File\.Contents\(\s*"([^"]+)"',
+                r'Xml\.Tables\(\s*File\.Contents\(\s*"([^"]+)"',
+                r'Access\.Database\(\s*File\.Contents\(\s*"([^"]+)"',
+                r'Folder\.Files\(\s*"([^"]+)"',
+                r'Folder\.Contents\(\s*"([^"]+)"',
+                # Web & APIs
                 r'Web\.Contents\(\s*"([^"]+)"',
+                r'Json\.Document\(\s*Web\.Contents\(\s*"([^"]+)"',
+                r'Xml\.Document\(\s*Web\.Contents\(\s*"([^"]+)"',
+                r'OData\.Feed\(\s*"([^"]+)"',
+                # SharePoint
                 r'SharePoint\.Files\(\s*"([^"]+)"',
                 r'SharePoint\.Contents\(\s*"([^"]+)"',
-                r'OData\.Feed\(\s*"([^"]+)"',
+                r'SharePoint\.Tables\(\s*"([^"]+)"',
+                # Generic ODBC / OleDb (connection string or DSN in first string arg)
+                r'Odbc\.DataSource\(\s*"([^"]+)"',
+                r'OleDb\.DataSource\(\s*"([^"]+)"',
             ]
             for pattern in patterns:
                 for match in re.findall(pattern, expr, flags=re.IGNORECASE):
@@ -439,7 +581,7 @@ def _extract_sources_from_rows(power_query_rows: Any, metadata_rows: Any) -> lis
             server, database = parts
             s = f"{server} (database: {database})"
         cleaned.add(s)
-    return sorted(cleaned)
+    return enrich_source_labels(sorted(cleaned), power_query_rows)
 
 
 def _dax_measure_docs_from_rows(measures_rows: Any) -> list[dict[str, Any]]:
@@ -557,6 +699,42 @@ def _relationship_details_from_rows(relationships_rows: Any) -> list[dict[str, A
     return details
 
 
+def _extract_rls_from_pbixray_model(model: Any) -> dict[str, Any]:
+    """Extract RLS roles from PBIXRay model (same candidate attrs as MCP server)."""
+    details: list[dict[str, Any]] = []
+    has_rls = False
+    candidate_attrs = (
+        "roles",
+        "rls",
+        "role_permissions",
+        "table_permissions",
+        "dax_rls",
+        "row_level_security",
+        "tmschema_role_memberships",
+    )
+    for attr in candidate_attrs:
+        try:
+            value = getattr(model, attr, None)
+            if value is None:
+                continue
+            if hasattr(value, "to_dict"):
+                rows = value.to_dict(orient="records")
+                if rows:
+                    has_rls = True
+                    details.append({"source": attr, "count": len(rows), "entries": rows[:50]})
+                continue
+            if isinstance(value, (list, tuple)) and len(value) > 0:
+                has_rls = True
+                details.append({"source": attr, "count": len(value), "entries": list(value)[:50]})
+                continue
+            if isinstance(value, dict) and len(value) > 0:
+                has_rls = True
+                details.append({"source": attr, "count": len(value), "entries": value})
+        except Exception:
+            continue
+    return {"has_rls": has_rls, "details": details}
+
+
 def _normalize_rls_from_mcp(rls_data: Any) -> dict[str, Any]:
     """
     Convert the MCP get_rls_roles response into a UI-friendly shape.
@@ -604,13 +782,16 @@ def _documentation_payload_from_mcp(
     key_columns = _key_columns(schema_rows)
 
     # RLS sourced from dedicated MCP tool (no longer hardcoded).
-    rls = _normalize_rls_from_mcp(rls_data or {})
+    rls_raw = rls_data if isinstance(rls_data, dict) else {"has_rls": False, "details": []}
+    rls = _normalize_rls_from_mcp(rls_raw)
 
     return {
         "report_sources": {"sources": sources},
         "report_model": {"tables": tables, "relationships": relationship_details},
         "dax_calculations": {"calculated_columns": dax_columns, "measures": measures},
-        "security_and_parameters": {"rls": rls, "parameters": m_parameters},
+        "security_and_parameters": {"rls": rls, "rls_raw": rls_raw, "parameters": m_parameters},
+        "model_schema": schema_rows,
+        "power_query": power_query_rows if isinstance(power_query_rows, list) else [],
         "data_sources": {
             "source_systems": sources,
             "tables_used": tables,
@@ -647,130 +828,349 @@ def _documentation_payload_from_mcp(
 async def _extract_context_via_mcp(resolved: str) -> dict[str, Any]:
     server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pbixray_server.py")
     params = StdioServerParameters(command=sys.executable, args=[server_path], env=None)
-    async with stdio_client(params) as streams:
-        async with ClientSession(streams[0], streams[1]) as session:
-            await session.initialize()
+    init_timeout = float(os.environ.get("MCP_INIT_TIMEOUT_SEC", "20"))
+    total_timeout = float(os.environ.get("MCP_TOTAL_EXTRACT_TIMEOUT_SEC", "90"))
 
-            load_result = await session.call_tool("load_pbix_file", {"file_path": resolved})
-            load_text = _mcp_text(load_result)
-            if load_text.lower().startswith("error:"):
-                raise RuntimeError(load_text)
+    async def _call_tool_text(
+        session: ClientSession,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        timeout_sec: float,
+        optional: bool = False,
+    ) -> str:
+        args = arguments or {}
+        logger.info("[mcp] call start tool=%s timeout=%.1fs optional=%s", tool_name, timeout_sec, optional)
+        try:
+            result = await asyncio.wait_for(session.call_tool(tool_name, args), timeout=timeout_sec)
+            text = _mcp_text(result)
+            logger.info("[mcp] call done tool=%s text_chars=%d", tool_name, len(text))
+            return text
+        except asyncio.TimeoutError:
+            msg = f"MCP tool timed out: {tool_name} after {timeout_sec:.1f}s"
+            if optional:
+                logger.warning("[mcp] %s (continuing with fallback)", msg)
+                return ""
+            logger.error("[mcp] %s", msg)
+            raise RuntimeError(msg)
+        except Exception as exc:
+            if optional:
+                logger.warning("[mcp] tool failed but optional tool=%s error=%s", tool_name, exc)
+                return ""
+            logger.error("[mcp] tool failed tool=%s error=%s", tool_name, exc)
+            raise
 
-            # All model introspection goes through MCP tools.
-            tables_text = _mcp_text(await session.call_tool("get_tables", {}))
-            stats_text = _mcp_text(await session.call_tool("get_statistics", {}))
-            measures_text = _mcp_text(await session.call_tool("get_dax_measures", {}))
-            dax_columns_text = _mcp_text(await session.call_tool("get_dax_columns", {}))
-            schema_text = _mcp_text(await session.call_tool("get_schema", {}))
-            relationships_text = _mcp_text(await session.call_tool("get_relationships", {}))
-            metadata_text = _mcp_text(await session.call_tool("get_metadata", {}))
-            power_query_text = _mcp_text(await session.call_tool("get_power_query", {}))
-            m_parameters_text = _mcp_text(await session.call_tool("get_m_parameters", {}))
-            model_summary_text = _mcp_text(await session.call_tool("get_model_summary", {}))
-            # Dedicated MCP tool for Row-Level Security roles.
-            rls_text = _mcp_text(await session.call_tool("get_rls_roles", {}))
+    required_timeout = float(os.environ.get("MCP_TOOL_TIMEOUT_SEC", "45"))
+    optional_timeout = float(os.environ.get("MCP_OPTIONAL_TOOL_TIMEOUT_SEC", "20"))
 
-            tables_data = _mcp_parse_json(tables_text, [])
-            stats_rows = _mcp_parse_json(stats_text, [])
-            measures_rows = _mcp_parse_json(measures_text, [])
-            dax_columns_rows = _mcp_parse_json(dax_columns_text, [])
-            schema_rows = _mcp_parse_json(schema_text, [])
-            relationships_rows = _mcp_parse_json(relationships_text, [])
-            metadata_data = _mcp_parse_json(metadata_text, {})
-            power_query_rows = _mcp_parse_json(power_query_text, [])
-            m_parameters_rows = _mcp_parse_json(m_parameters_text, [])
-            model_summary = _mcp_parse_json(model_summary_text, {})
-            rls_data = _mcp_parse_json(rls_text, {"has_rls": False, "details": []})
+    async def _run_mcp_pipeline() -> dict[str, Any]:
+        logger.info("[mcp] opening stdio client server_path=%s", server_path)
+        async with stdio_client(params) as streams:
+            logger.info("[mcp] stdio client connected")
+            async with ClientSession(streams[0], streams[1]) as session:
+                logger.info("[mcp] session initialize start timeout=%.1fs", init_timeout)
+                try:
+                    await asyncio.wait_for(session.initialize(), timeout=init_timeout)
+                except asyncio.TimeoutError:
+                    msg = f"MCP session initialize timed out after {init_timeout:.1f}s"
+                    logger.error("[mcp] %s", msg)
+                    raise RuntimeError(msg)
+                logger.info("[mcp] session initialize done")
 
-            tables = _coerce_tables(tables_data)
-            if not tables and isinstance(model_summary, dict):
-                tables = _coerce_tables(model_summary.get("tables", []))
-            if not isinstance(stats_rows, list):
-                stats_rows = []
-            if not isinstance(schema_rows, list):
-                schema_rows = []
-            if not tables and stats_rows:
-                tables = sorted(
-                    {
-                        str(row.get("TableName")).strip()
-                        for row in stats_rows
-                        if isinstance(row, dict) and str(row.get("TableName") or "").strip()
-                    }
+                load_text = await _call_tool_text(
+                    session,
+                    "load_pbix_file",
+                    {"file_path": resolved},
+                    timeout_sec=required_timeout,
+                    optional=False,
+                )
+                if load_text.lower().startswith("error:"):
+                    raise RuntimeError(load_text)
+
+                # All model introspection goes through MCP tools.
+                # NOTE: The MCP server (pbixray_server.py) now filters internal
+                # tables at the source, so the data returned here is already clean.
+                # We still apply _filter_* as a safety net.
+                tables_text = await _call_tool_text(
+                    session, "get_tables", {}, timeout_sec=required_timeout, optional=False
+                )
+                stats_text = await _call_tool_text(
+                    session, "get_statistics", {}, timeout_sec=required_timeout, optional=False
+                )
+                measures_text = await _call_tool_text(
+                    session, "get_dax_measures", {}, timeout_sec=required_timeout, optional=False
+                )
+                dax_columns_text = await _call_tool_text(
+                    session, "get_dax_columns", {}, timeout_sec=required_timeout, optional=False
+                )
+                schema_text = await _call_tool_text(
+                    session, "get_schema", {}, timeout_sec=required_timeout, optional=False
+                )
+                relationships_text = await _call_tool_text(
+                    session, "get_relationships", {}, timeout_sec=required_timeout, optional=False
+                )
+                metadata_text = await _call_tool_text(
+                    session, "get_metadata", {}, timeout_sec=optional_timeout, optional=True
+                )
+                power_query_text = await _call_tool_text(
+                    session, "get_power_query", {}, timeout_sec=optional_timeout, optional=True
+                )
+                m_parameters_text = await _call_tool_text(
+                    session, "get_m_parameters", {}, timeout_sec=optional_timeout, optional=True
+                )
+                model_summary_text = await _call_tool_text(
+                    session, "get_model_summary", {}, timeout_sec=optional_timeout, optional=True
+                )
+                # Dedicated MCP tool for Row-Level Security roles.
+                rls_text = await _call_tool_text(
+                    session, "get_rls_roles", {}, timeout_sec=optional_timeout, optional=True
                 )
 
-            measures = _mcp_measure_names(measures_rows)
-            relationships = _mcp_relationship_lines(relationships_rows)
-            story_context = build_story_context(resolved, tables, stats_rows)
+                tables_data = _mcp_parse_json(tables_text, [])
+                stats_rows = _mcp_parse_json(stats_text, [])
+                measures_rows = _mcp_parse_json(measures_text, [])
+                dax_columns_rows = _mcp_parse_json(dax_columns_text, [])
+                schema_rows = _mcp_parse_json(schema_text, [])
+                relationships_rows = _mcp_parse_json(relationships_text, [])
+                metadata_data = _mcp_parse_json(metadata_text, {})
+                power_query_rows = _mcp_parse_json(power_query_text, [])
+                m_parameters_rows = _mcp_parse_json(m_parameters_text, [])
+                model_summary = _mcp_parse_json(model_summary_text, {})
+                rls_data = _mcp_parse_json(rls_text, {"has_rls": False, "details": []})
 
-            metadata_rows: list[dict[str, Any]] = []
-            if isinstance(metadata_data, dict):
-                metadata_rows = [{"Name": k, "Value": v} for k, v in metadata_data.items()]
-
-            sources = _extract_sources_from_rows(power_query_rows, metadata_rows)
-
-            # ---- Debug logs ----
-            try:
-                logger.info(
-                    "[mcp] tables=%d stats=%d measures=%d dax_cols=%d rels=%d "
-                    "meta_keys=%d pq=%d m_params=%d rls_has=%s rls_details=%d",
-                    len(tables),
-                    len(stats_rows) if isinstance(stats_rows, list) else -1,
-                    len(measures_rows) if isinstance(measures_rows, list) else -1,
-                    len(dax_columns_rows) if isinstance(dax_columns_rows, list) else -1,
-                    len(relationships_rows) if isinstance(relationships_rows, list) else -1,
-                    len(metadata_data) if isinstance(metadata_data, dict) else -1,
-                    len(power_query_rows) if isinstance(power_query_rows, list) else -1,
-                    len(m_parameters_rows) if isinstance(m_parameters_rows, list) else -1,
-                    rls_data.get("has_rls") if isinstance(rls_data, dict) else "?",
-                    len(rls_data.get("details", [])) if isinstance(rls_data, dict) else -1,
-                )
-                if isinstance(relationships_rows, list) and relationships_rows:
-                    logger.info(
-                        "[mcp] relationship sample keys=%s",
-                        list(relationships_rows[0].keys()) if isinstance(relationships_rows[0], dict) else "n/a",
+                tables = _coerce_tables(tables_data)
+                if not tables and isinstance(model_summary, dict):
+                    tables = _coerce_tables(model_summary.get("tables", []))
+                if not isinstance(stats_rows, list):
+                    stats_rows = []
+                if not isinstance(schema_rows, list):
+                    schema_rows = []
+                if not tables and stats_rows:
+                    tables = sorted(
+                        {
+                            str(row.get("TableName")).strip()
+                            for row in stats_rows
+                            if isinstance(row, dict) and str(row.get("TableName") or "").strip()
+                        }
                     )
-            except Exception:
-                pass
-            # --------------------
 
-            documentation = _documentation_payload_from_mcp(
-                tables=tables,
-                relationships=relationships,
-                schema_rows=schema_rows,
-                metadata_rows=metadata_rows,
-                power_query_rows=power_query_rows,
-                measures_rows=measures_rows,
-                dax_columns_rows=dax_columns_rows,
-                m_parameters_rows=m_parameters_rows,
-                relationships_rows=relationships_rows,
-                rls_data=rls_data,
-            )
+                # Safety-net filtering (MCP server already filters, but belt-and-suspenders)
+                tables = _filter_table_names(tables)
+                stats_rows = _filter_rows_by_table_name(stats_rows, ("TableName",))
+                schema_rows = _filter_rows_by_table_name(schema_rows, ("TableName",))
+                relationships_rows = _filter_rows_by_table_name(relationships_rows, ("FromTableName", "ToTableName"), drop_none=True)
+                measures_rows = _filter_rows_by_table_name(measures_rows, ("TableName",))
+                dax_columns_rows = _filter_rows_by_table_name(dax_columns_rows, ("TableName",))
+                power_query_rows = _filter_rows_by_table_name(power_query_rows, ("TableName",))
 
-            return {
-                "tables": tables,
-                "stats_rows": stats_rows,
-                "story_context": story_context,
-                "measures": measures,
-                "relationships": relationships,
-                "sources": sources,
-                "documentation": documentation,
-            }
+                measures = _mcp_measure_names(measures_rows)
+                relationships = _mcp_relationship_lines(relationships_rows)
+                story_context = build_story_context(resolved, tables, stats_rows, measures)
+
+                metadata_rows: list[dict[str, Any]] = []
+                if isinstance(metadata_data, dict):
+                    metadata_rows = [{"Name": k, "Value": v} for k, v in metadata_data.items()]
+
+                sources = _extract_sources_from_rows(power_query_rows, metadata_rows)
+
+                # ---- Debug logs ----
+                try:
+                    logger.info(
+                        "[mcp] tables=%d stats=%d measures=%d dax_cols=%d rels=%d "
+                        "meta_keys=%d pq=%d m_params=%d rls_has=%s rls_details=%d",
+                        len(tables),
+                        len(stats_rows) if isinstance(stats_rows, list) else -1,
+                        len(measures_rows) if isinstance(measures_rows, list) else -1,
+                        len(dax_columns_rows) if isinstance(dax_columns_rows, list) else -1,
+                        len(relationships_rows) if isinstance(relationships_rows, list) else -1,
+                        len(metadata_data) if isinstance(metadata_data, dict) else -1,
+                        len(power_query_rows) if isinstance(power_query_rows, list) else -1,
+                        len(m_parameters_rows) if isinstance(m_parameters_rows, list) else -1,
+                        rls_data.get("has_rls") if isinstance(rls_data, dict) else "?",
+                        len(rls_data.get("details", [])) if isinstance(rls_data, dict) else -1,
+                    )
+                    if isinstance(relationships_rows, list) and relationships_rows:
+                        logger.info(
+                            "[mcp] relationship sample keys=%s",
+                            list(relationships_rows[0].keys()) if isinstance(relationships_rows[0], dict) else "n/a",
+                        )
+                except Exception:
+                    pass
+                # --------------------
+
+                documentation = _documentation_payload_from_mcp(
+                    tables=tables,
+                    relationships=relationships,
+                    schema_rows=schema_rows,
+                    metadata_rows=metadata_rows,
+                    power_query_rows=power_query_rows,
+                    measures_rows=measures_rows,
+                    dax_columns_rows=dax_columns_rows,
+                    m_parameters_rows=m_parameters_rows,
+                    relationships_rows=relationships_rows,
+                    rls_data=rls_data,
+                )
+
+                return {
+                    "tables": tables,
+                    "stats_rows": stats_rows,
+                    "story_context": story_context,
+                    "measures": measures,
+                    "relationships": relationships,
+                    "sources": sources,
+                    "documentation": documentation,
+                }
+
+    logger.info("[mcp] extraction pipeline start timeout=%.1fs file=%s", total_timeout, resolved)
+    try:
+        payload = await asyncio.wait_for(_run_mcp_pipeline(), timeout=total_timeout)
+        logger.info("[mcp] extraction pipeline done")
+        return payload
+    except asyncio.TimeoutError:
+        msg = f"MCP extraction timed out after {total_timeout:.1f}s"
+        logger.error("[mcp] %s", msg)
+        raise RuntimeError(msg)
 
 
 def _extract_context_via_mcp_sync(resolved: str) -> dict[str, Any]:
     return asyncio.run(_extract_context_via_mcp(resolved))
 
 
+def _safe_df_records(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if hasattr(value, "to_dict"):
+        try:
+            rows = value.to_dict(orient="records")
+            return rows if isinstance(rows, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _extract_context_direct(resolved: str) -> dict[str, Any]:
+    """
+    Fallback extractor when MCP handshake/initialize is unavailable.
+    Uses PBIXRay directly in-process to avoid MCP transport issues.
+    """
+    logger.warning("[direct] falling back to in-process PBIXRay extraction for file=%s", resolved)
+    model = PBIXRay(resolved)
+
+    tables = _filter_table_names(normalize_tables(getattr(model, "tables", [])))
+    stats_rows = _filter_rows_by_table_name(_safe_df_records(getattr(model, "statistics", None)), ("TableName",))
+    schema_rows = _filter_rows_by_table_name(_safe_df_records(getattr(model, "schema", None)), ("TableName",))
+    measures_rows = _filter_rows_by_table_name(_safe_df_records(getattr(model, "dax_measures", None)), ("TableName",))
+    dax_columns_rows = _filter_rows_by_table_name(_safe_df_records(getattr(model, "dax_columns", None)), ("TableName",))
+    relationships_rows = _filter_rows_by_table_name(
+        _safe_df_records(getattr(model, "relationships", None)),
+        ("FromTableName", "ToTableName"),
+        drop_none=True,
+    )
+    power_query_rows = _filter_rows_by_table_name(
+        _safe_df_records(getattr(model, "power_query", None)),
+        ("TableName",),
+    )
+    m_parameters_rows = _safe_df_records(getattr(model, "m_parameters", None))
+
+    metadata_rows = _safe_df_records(getattr(model, "metadata", None))
+    metadata_data: dict[str, Any] = {}
+    for row in metadata_rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("Name") or "").strip()
+        if not name:
+            continue
+        metadata_data[name] = row.get("Value")
+
+    measures = _mcp_measure_names(measures_rows)
+    relationships = _mcp_relationship_lines(relationships_rows)
+    story_context = build_story_context(resolved, tables, stats_rows, measures)
+    sources = _extract_sources_from_rows(power_query_rows, metadata_rows)
+
+    rls_data = _extract_rls_from_pbixray_model(model)
+    documentation = _documentation_payload_from_mcp(
+        tables=tables,
+        relationships=relationships,
+        schema_rows=schema_rows,
+        metadata_rows=metadata_rows,
+        power_query_rows=power_query_rows,
+        measures_rows=measures_rows,
+        dax_columns_rows=dax_columns_rows,
+        m_parameters_rows=m_parameters_rows,
+        relationships_rows=relationships_rows,
+        rls_data=rls_data,
+    )
+
+    logger.info(
+        "[direct] tables=%d stats=%d measures=%d dax_cols=%d rels=%d meta_keys=%d pq=%d m_params=%d",
+        len(tables),
+        len(stats_rows),
+        len(measures_rows),
+        len(dax_columns_rows),
+        len(relationships_rows),
+        len(metadata_data),
+        len(power_query_rows),
+        len(m_parameters_rows),
+    )
+
+    return {
+        "tables": tables,
+        "stats_rows": stats_rows,
+        "story_context": story_context,
+        "measures": measures,
+        "relationships": relationships,
+        "sources": sources,
+        "documentation": documentation,
+        "context_source": "direct",
+    }
+
+
+def _launch_power_bi_desktop(target_path: Path) -> tuple[bool, str]:
+    pbidesktop_exe = os.environ.get("POWERBI_DESKTOP_EXE", "").strip()
+    candidates: list[list[str]] = []
+
+    if pbidesktop_exe:
+        candidates.append([pbidesktop_exe, str(target_path)])
+    candidates.append(["cmd", "/c", "start", "", str(target_path)])
+    candidates.append(["powershell", "-NoProfile", "-Command", f'Start-Process -FilePath "{str(target_path)}"'])
+
+    last_error = ""
+    for cmd in candidates:
+        try:
+            subprocess.Popen(cmd)
+            return True, "Power BI launch command started."
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+    return False, last_error or "Unable to launch Power BI Desktop."
+
+
 def extract_pbix_payload(resolved: str) -> dict[str, Any]:
-    mcp_payload = _extract_context_via_mcp_sync(resolved)
+    context_source = "mcp"
+    try:
+        mcp_payload = _extract_context_via_mcp_sync(resolved)
+        context_source = "mcp"
+        if not isinstance(mcp_payload, dict):
+            raise RuntimeError("MCP extraction returned an invalid payload")
+    except Exception as exc:
+        logger.warning("[extract] MCP path failed, switching to direct PBIXRay: %s", exc)
+        mcp_payload = _extract_context_direct(resolved)
+        context_source = str(mcp_payload.get("context_source") or "direct")
     tables = mcp_payload["tables"]
     stats_rows = mcp_payload["stats_rows"]
     story_context = mcp_payload["story_context"]
-    columns = _columns_by_table(stats_rows)
+    schema_rows = _filter_rows_by_table_name(
+        _ensure_list((mcp_payload.get("documentation") or {}).get("model_schema")),
+        ("TableName",),
+    )
+    if not schema_rows:
+        schema_rows = _filter_rows_by_table_name(_ensure_list(stats_rows), ("TableName",))
+    columns = _columns_by_table(schema_rows if schema_rows else stats_rows)
     measures = mcp_payload["measures"]
     relationships = mcp_payload["relationships"]
     sources = mcp_payload.get("sources", [])
     documentation = mcp_payload.get("documentation", {})
+    power_query_rows = _ensure_list(documentation.get("power_query"))
     summary = summarize(stats_rows)
 
     raw_context = _build_raw_context(
@@ -790,14 +1190,90 @@ def extract_pbix_payload(resolved: str) -> dict[str, Any]:
         "stats_preview": stats_rows[:100],
         "context": story_context,
         "columns": columns,
+        "schema": schema_rows,
         "measures": measures,
         "relationships": relationships,
         "sources": sources,
+        "power_query": power_query_rows,
         "documentation": documentation,
         "rawContext": raw_context,
-        "contextSource": "mcp",
+        "contextSource": context_source,
         "contextError": "",
     }
+
+
+def _ensure_list(value: Any) -> list:
+    """Convert any value to a plain Python list safely."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if hasattr(value, "tolist"):
+        try:
+            return value.tolist()
+        except Exception:
+            pass
+    if hasattr(value, "to_dict"):
+        try:
+            return value.to_dict(orient="records")
+        except Exception:
+            pass
+    if hasattr(value, "__iter__") and not isinstance(value, (str, dict)):
+        try:
+            return list(value)
+        except (TypeError, ValueError):
+            pass
+    return []
+
+
+def _build_pdf_context_from_extracted(payload: dict[str, Any]) -> dict[str, Any]:
+    documentation = payload.get("documentation") or {}
+    report_sources = documentation.get("report_sources") or {}
+    report_model = documentation.get("report_model") or {}
+    data_model = documentation.get("data_model") or {}
+    dax_calculations = documentation.get("dax_calculations") or {}
+    security_and_parameters = documentation.get("security_and_parameters") or {}
+    security_rls = security_and_parameters.get("rls")
+    rls_raw = security_and_parameters.get("rls_raw")
+
+    stats_rows = _ensure_list(payload.get("stats_preview") or payload.get("statistics") or [])
+    schema_rows = _ensure_list(documentation.get("model_schema") or payload.get("schema"))
+    columns = payload.get("columns") if isinstance(payload.get("columns"), dict) else {}
+    if not columns and stats_rows:
+        columns = _columns_by_table(stats_rows)
+
+    return {
+        "filename": str(payload.get("uploaded_name") or payload.get("file_name") or "PowerBI_Documentation.pbix"),
+        "sources": _ensure_list(report_sources.get("sources") or payload.get("sources")),
+        "tables": _ensure_list(report_model.get("tables") or payload.get("tables")),
+        "relationships": _ensure_list(report_model.get("relationships") or payload.get("relationships")),
+        "measures": _ensure_list(dax_calculations.get("measures")),
+        "calculated_columns": _ensure_list(dax_calculations.get("calculated_columns")),
+        "rls": rls_raw if rls_raw else security_rls,
+        "parameters": _ensure_list(security_and_parameters.get("parameters")),
+        "schema": schema_rows,
+        "statistics": stats_rows,
+        "columns": columns,
+        "power_query": _ensure_list(
+            payload.get("power_query")
+            or documentation.get("power_query")
+        ),
+        "table_roles": _ensure_list(data_model.get("table_roles")),
+    }
+
+
+def _cache_doc_context(payload: dict[str, Any], uploaded_filename: str) -> None:
+    context = _build_pdf_context_from_extracted(payload)
+    key = uploaded_filename.strip().lower()
+    if key:
+        _DOC_CONTEXT_CACHE[key] = context
+    _DOC_CONTEXT_CACHE[_DOC_CONTEXT_LAST_KEY] = context
+
+    # Avoid unbounded growth.
+    keys = [k for k in _DOC_CONTEXT_CACHE.keys() if k != _DOC_CONTEXT_LAST_KEY]
+    if len(keys) > _DOC_CACHE_MAX_ITEMS:
+        for old_key in keys[:-_DOC_CACHE_MAX_ITEMS]:
+            _DOC_CONTEXT_CACHE.pop(old_key, None)
 
 
 @app.get("/")
@@ -832,28 +1308,309 @@ def api_pbix_context():
 
 @app.post("/api/pbix/upload")
 def api_pbix_upload():
+    logger.info("[upload] request received content_length=%s", request.content_length)
     upload = request.files.get("file")
     if upload is None:
         return jsonify({"ok": False, "error": "Missing file field."}), 400
 
     filename = upload.filename or ""
+    logger.info("[upload] processing filename=%s", filename)
     if not filename.lower().endswith(".pbix"):
         return jsonify({"ok": False, "error": "Only .pbix files are accepted."}), 400
 
-    fd, tmp_path = tempfile.mkstemp(prefix="pbix_story_", suffix=".pbix")
-    os.close(fd)
+    cleanup_old_uploads()
+    pbix_id = str(uuid.uuid4())
+    dest = upload_dir() / f"{pbix_id}.pbix"
     try:
-        upload.save(tmp_path)
-        payload = extract_pbix_payload(tmp_path)
+        upload.save(str(dest))
+        logger.info("[upload] saved pbix id=%s path=%s", pbix_id, dest)
+        logger.info("[upload] starting extract_pbix_payload")
+        payload = extract_pbix_payload(str(dest))
+        logger.info("[upload] extract_pbix_payload completed ok=%s", payload.get("ok"))
         payload["uploaded_name"] = filename
+        payload["pbix_id"] = pbix_id
+        payload["pbix_path"] = str(dest)
+        register_upload(pbix_id, dest, filename)
+        _cache_doc_context(payload, filename)
         return jsonify(payload)
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
-    finally:
         try:
-            os.remove(tmp_path)
+            dest.unlink(missing_ok=True)
         except OSError:
             pass
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+def _normalize_patch_measures(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("measures must be a non-empty list")
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        table_name = str(item.get("table_name") or "").strip()
+        measure_name = str(item.get("measure_name") or "").strip()
+        dax_expression = str(item.get("dax_expression") or "").strip()
+        if not table_name or not measure_name or not dax_expression:
+            raise ValueError(
+                "Each measure requires table_name, measure_name, and dax_expression."
+            )
+        out.append(
+            {
+                "table_name": table_name,
+                "measure_name": measure_name,
+                "dax_expression": dax_expression,
+                "format_string": str(item.get("format_string") or ""),
+                "description": str(item.get("description") or ""),
+                "display_folder": str(item.get("display_folder") or ""),
+            }
+        )
+    if not out:
+        raise ValueError("measures must contain at least one valid measure object")
+    return out
+
+
+def _patch_measures_tabular_script(
+    patcher: PBIXPatcher,
+    measures: list[dict[str, str]],
+    original_filename: str,
+) -> Response:
+    script = patcher.generate_tabular_editor_script(
+        [
+            {
+                "table_name": m["table_name"],
+                "measure_name": m["measure_name"],
+                "dax_expression": m["dax_expression"],
+                "format_string": m.get("format_string", ""),
+                "description": m.get("description", ""),
+            }
+            for m in measures
+        ]
+    )
+    stem = Path(original_filename).stem or "model"
+    download_name = f"{stem}_measures.csx"
+    return Response(
+        script,
+        mimetype="text/plain",
+        headers={
+            "Content-Disposition": f'attachment; filename="{download_name}"',
+            "X-Patch-Method": "tabular-editor-script",
+        },
+    )
+
+
+@app.post("/api/pbix/patch-measures")
+def api_pbix_patch_measures():
+    body = request.get_json(silent=True) or {}
+    pbix_id = str(body.get("pbix_id") or "").strip()
+    if not pbix_id:
+        return jsonify({"ok": False, "error": "pbix_id is required"}), 400
+
+    try:
+        measures = _normalize_patch_measures(body.get("measures"))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    meta = get_upload(pbix_id)
+    if not meta:
+        return jsonify({"ok": False, "error": "Unknown or expired pbix_id. Re-upload the file."}), 404
+
+    pbix_path = Path(meta["file_path"])
+    if not pbix_path.exists():
+        return jsonify({"ok": False, "error": "PBIX file no longer on server. Re-upload the file."}), 404
+
+    original_filename = str(meta.get("original_filename") or pbix_path.name)
+    stem = Path(original_filename).stem or "model"
+
+    patcher = PBIXPatcher(str(pbix_path))
+    try:
+        patcher.extract()
+    except PBIXPatcherError as exc:
+        if "DataModelSchema not found" in str(exc):
+            logger.info("[patch] DataModelSchema missing; returning Tabular Editor script pbix_id=%s", pbix_id)
+            try:
+                return _patch_measures_tabular_script(patcher, measures, original_filename)
+            finally:
+                patcher.cleanup()
+        patcher.cleanup()
+        logger.exception("[patch] extract failed pbix_id=%s", pbix_id)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    except Exception as exc:
+        patcher.cleanup()
+        logger.exception("[patch] extract failed pbix_id=%s", pbix_id)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    try:
+        for m in measures:
+            patcher.add_measure(
+                table_name=m["table_name"],
+                measure_name=m["measure_name"],
+                dax_expression=m["dax_expression"],
+                format_string=m.get("format_string", ""),
+                description=m.get("description", ""),
+                display_folder=m.get("display_folder", ""),
+                overwrite=True,
+            )
+        output_path = patcher.repackage(
+            str(upload_dir() / f"{pbix_id}_patched.pbix")
+        )
+    except PBIXPatcherError as exc:
+        patcher.cleanup()
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        patcher.cleanup()
+        logger.exception("[patch] apply/repackage failed pbix_id=%s", pbix_id)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    download_name = f"{stem}_patched.pbix"
+
+    @after_this_request
+    def _remove_patched_file(response):  # noqa: ANN001
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            patcher.cleanup()
+        except Exception:
+            pass
+        return response
+
+    return send_file(
+        output_path,
+        as_attachment=True,
+        download_name=download_name,
+        mimetype="application/octet-stream",
+        headers={"X-Patch-Method": "direct"},
+    )
+
+
+@app.post("/api/pbix/open-uploaded")
+def api_pbix_open_uploaded():
+    upload = request.files.get("file")
+    if upload is None:
+        return jsonify({"ok": False, "error": "Missing file field."}), 400
+
+    filename = (upload.filename or "").strip()
+    if not filename.lower().endswith(".pbix"):
+        return jsonify({"ok": False, "error": "Only .pbix files are accepted."}), 400
+
+    safe_name = os.path.basename(filename) or "uploaded.pbix"
+    stamp = int(time.time())
+    target_path = Path(tempfile.gettempdir()) / f"pbix_story_open_{stamp}_{safe_name}"
+
+    try:
+        upload.save(str(target_path))
+        opened, launch_message = _launch_power_bi_desktop(target_path)
+        status = 200 if opened else 500
+        return (
+            jsonify(
+                {
+                    "ok": opened,
+                    "opened": opened,
+                    "file_name": safe_name,
+                    "pbix_path": str(target_path),
+                    "launch_message": launch_message,
+                }
+            ),
+            status,
+        )
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Failed to open uploaded PBIX: {exc}"}), 500
+
+
+@app.post("/documentation/generate-pdf")
+def api_documentation_generate_pdf():
+    body = request.get_json(silent=True) or {}
+    filename = str(body.get("filename") or "").strip()
+    context_payload: dict[str, Any] = {}
+    cache_key = filename.lower() if filename else ""
+
+    cached_payload: dict[str, Any] = {}
+    if cache_key and cache_key in _DOC_CONTEXT_CACHE:
+        cached_payload = dict(_DOC_CONTEXT_CACHE[cache_key])
+    elif _DOC_CONTEXT_LAST_KEY in _DOC_CONTEXT_CACHE:
+        cached_payload = dict(_DOC_CONTEXT_CACHE[_DOC_CONTEXT_LAST_KEY])
+
+    if any(
+        key in body
+        for key in (
+            "sources",
+            "tables",
+            "relationships",
+            "measures",
+            "calculated_columns",
+            "rls",
+            "parameters",
+            "schema",
+            "power_query",
+            "columns",
+            "table_roles",
+        )
+    ):
+        body_power_query = _ensure_list(body.get("power_query"))
+        context_payload = {
+            "filename": filename or "PowerBI_Documentation.pbix",
+            "sources": body.get("sources") or [],
+            "tables": body.get("tables") or [],
+            "relationships": body.get("relationships") or [],
+            "measures": body.get("measures") or [],
+            "calculated_columns": body.get("calculated_columns") or [],
+            "rls": body.get("rls") or [],
+            "parameters": body.get("parameters") or [],
+            "schema": body.get("schema") or [],
+            "power_query": body_power_query or _ensure_list(cached_payload.get("power_query")),
+            "columns": body.get("columns") or {},
+            "table_roles": body.get("table_roles") or [],
+        }
+    elif cached_payload:
+        context_payload = cached_payload
+
+    if not context_payload:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "No cached documentation context found. Upload a .pbix file first before generating the PDF.",
+                }
+            ),
+            400,
+        )
+
+    if filename:
+        context_payload["filename"] = filename
+
+    def stream() -> Iterator[str]:
+        try:
+            full_context = dict(context_payload)
+
+            yield f"data: {json.dumps({'type': 'progress', 'step': 'prepare', 'message': 'Préparation des données du modèle...'})}\n\n"
+            ctx = prepare_pdf_context(full_context)
+            yield f"data: {json.dumps({'type': 'step_done', 'step': 'prepare'})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'progress', 'step': 'enriching', 'message': 'Descriptions métier et analyse IA...'})}\n\n"
+            ctx["enrichment"] = build_deterministic_enrichment(ctx)
+            llm = enrich_documentation_json(ctx)
+            yield f"data: {json.dumps({'type': 'step_done', 'step': 'enriching'})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'progress', 'step': 'pdf', 'message': 'Génération du PDF ReportLab...'})}\n\n"
+            doc = assemble_reportlab_document(ctx, llm)
+            pdf_bytes = build_reportlab_pdf(doc)
+            output_name = f"{os.path.splitext(os.path.basename(str(ctx.get('filename') or 'doc.pbix')))[0]}_documentation.pdf"
+
+            pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+            yield f"data: {json.dumps({'type': 'complete', 'pdf_base64': pdf_b64, 'filename': output_name})}\n\n"
+        except requests.exceptions.Timeout:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Ollama timed out. Make sure Ollama is running and the model is loaded.'})}\n\n"
+        except Exception as exc:
+            logger.error("[documentation-pdf] SSE generation failed: %s\n%s", exc, traceback.format_exc())
+            yield f"data: {json.dumps({'type': 'error', 'message': f'PDF generation failed: {exc}'})}\n\n"
+
+    return Response(
+        stream_with_context(stream()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 DAX_SYSTEM_PROMPT = """You are an expert Power BI DAX developer.
@@ -877,7 +1634,7 @@ Provide 3-5 concrete suggestions:
 - Alternative approaches
 - Related measures they might need
 
-Be concise but thorough. Format code blocks with backticks.
+Be concise but thorough. Format code blocks with backticks.Every section MUST have at least 3 bullet points. No exceptions.
 """
 
 
@@ -1085,13 +1842,41 @@ Reference real relationships when using RELATED or USERELATIONSHIP.
 
 
 STORY_RULES = """You are a senior Power BI analytics storyteller.
-Create a concise narrative for a business stakeholder using ONLY the provided context.
+You will receive extracted metadata from a .pbix file. Your job is to produce a concise, grounded narrative for a business stakeholder.
 
-Output format rules:
-1) Use exactly these markdown headings: # Overview, # Key Insights, # Risks or Data Quality Concerns, # Recommended Actions
-2) Under each heading use 3-6 bullet points
-3) Be concrete with table/column names from the context
-4) Do not invent metrics or percentages not implied by the context"""
+ANALYSIS APPROACH:
+- Identify fact tables vs dimension/lookup tables by row count patterns
+- Flag high-cardinality columns relative to table size
+- Note tables with no relationships or orphan columns
+- Look for naming inconsistencies suggesting modeling issues
+- Infer the business domain from table and column names
+
+ANALYSIS DEPTH:
+- For each large table (highest row counts), describe its likely role (fact vs dimension), its key columns, and any quality signals
+- For each relationship detected, note whether it follows standard star-schema patterns or something unusual
+- For each column with notably high cardinality, assess whether this is expected or a potential grain issue
+- If measures or calculated columns are present, briefly describe what each appears to compute and which tables it depends on
+
+OUTPUT FORMAT (strict):
+Use exactly these markdown headings:
+# Overview
+# Key Insights
+# Risks or Data Quality Concerns
+# Recommended Actions
+
+RULES:
+- 3-6 bullet points per section
+- Every bullet must cite at least one table or column name from context
+- Do not invent metrics, percentages, or row counts not present in context
+- If uncertain about something, say "likely" or "suggests" — do not state as fact
+- Recommended Actions must reference which insight or risk they address
+- Be specific enough that a developer could act on each bullet without asking followup questions
+
+SECTION PURPOSES:
+- Overview: business domain, model scale, structural summary
+- Key Insights: non-obvious patterns a stakeholder should know
+- Risks: concrete data quality or modeling problems found in context
+- Recommended Actions: specific next steps tied to identified risks/insights"""
 
 
 @app.post("/api/story/generate")
@@ -1108,9 +1893,14 @@ def api_story_generate():
     if context is None:
         return jsonify({"ok": False, "error": "context is required"}), 400
 
+    focus_check_text = ""
     if isinstance(context, str):
         context_text = context.strip()
+        focus_check_text = context_text
     else:
+        if isinstance(context, dict):
+            focus_check_text = json.dumps(context, ensure_ascii=True)
+            context = compact_story_context_for_prompt(context)
         try:
             context_text = json.dumps(context, ensure_ascii=True)
         except Exception:
@@ -1120,7 +1910,7 @@ def api_story_generate():
     if not context_text:
         return jsonify({"ok": False, "error": "context must not be empty"}), 400
 
-    max_ctx_chars = int(os.environ.get("STORY_MAX_CONTEXT_CHARS", "12000"))
+    max_ctx_chars = int(os.environ.get("STORY_MAX_CONTEXT_CHARS", "6000"))
     if max_ctx_chars > 0 and len(context_text) > max_ctx_chars:
         logger.warning(
             "[story] req_id=%s truncating context %d -> %d chars",
@@ -1130,11 +1920,32 @@ def api_story_generate():
         )
         context_text = context_text[:max_ctx_chars] + "\n\n[... truncated by server ...]"
 
+    # Validate focus against full client context (before compacting for Ollama).
+    if focus and not focus_matches_context(focus_check_text or context_text, focus):
+        return jsonify({
+            "ok": False,
+            "error_type": "invalid_focus",
+            "error": (
+                f"The focus area '{focus}' is not related to this Power BI model. "
+                "Try using table names, column names, or business concepts from your data."
+            ),
+        }), 400
+
     story_temp = float(os.environ.get("STORY_OLLAMA_TEMPERATURE", "0.2"))
-    system_prompt = f"{STORY_RULES}\n\nContext:\n{context_text}"
-    user_content = "Generate a story about this Power BI report."
+    system_prompt = STORY_RULES
     if focus:
-        user_content += f"\n\nFocus area: {focus}"
+        user_content = (
+            f"Power BI model metadata (JSON):\n{context_text}\n\n"
+            f"Analyze this model with emphasis on: {focus}. "
+            "At least half of Key Insights and Recommended Actions should relate to that focus. "
+            "Still cover overall model health in Overview and Risks."
+        )
+    else:
+        user_content = (
+            f"Power BI model metadata (JSON):\n{context_text}\n\n"
+            "Identify the most important structural patterns, data quality risks, and actionable "
+            "recommendations. Write for a business stakeholder who has not seen this model before."
+        )
 
     def generate() -> Iterator[str]:
         yield f"data: {json.dumps({'type': 'start', 'req_id': req_id})}\n\n"

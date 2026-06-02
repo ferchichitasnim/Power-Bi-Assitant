@@ -1,3 +1,9 @@
+export type ModelTableForPrompt = {
+  name: string;
+  columns: string[];
+  measures: string[];
+};
+
 export type DaxModeRequest = {
   prompt: string;
   model?: string;
@@ -12,6 +18,7 @@ export type SemanticModelContext = {
   columns: Record<string, string[]>;
   measures: string[];
   relationships: string[];
+  modelTables?: ModelTableForPrompt[];
 };
 
 export type ReducedTable = {

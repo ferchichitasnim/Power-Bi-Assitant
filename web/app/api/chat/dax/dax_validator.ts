@@ -49,14 +49,29 @@ export function validateDax(dax: string, intent: ParsedIntent, ctx: ReducedDaxCo
     const tableName = m[1].trim();
     const colName = m[2].trim();
     const ref = `'${tableName.toLowerCase()}'[${colName.toLowerCase()}]`;
+    const bareRef = `${tableName.toLowerCase()}[${colName.toLowerCase()}]`;
 
-    // Check if it's a known column
-    if (!ctx.allColumnRefs.has(ref)) {
-      // Check if [colName] is actually an existing measure on that table
-      // Measures are often referenced as 'Table'[Measure] or just [Measure]
-      if (!knownMeasures.has(colName.toLowerCase())) {
+    if (!ctx.allColumnRefs.has(ref) && !ctx.allColumnRefs.has(bareRef)) {
+      const measureOnTable = knownMeasures.has(`${tableName.toLowerCase()}[${colName.toLowerCase()}]`.toLowerCase());
+      if (!knownMeasures.has(colName.toLowerCase()) && !measureOnTable) {
         issues.push(`Unknown field reference: '${tableName}'[${colName}].`);
         log("unknown_ref", { ref, knownColumns: Array.from(ctx.allColumnRefs).slice(0, 10), knownMeasures: ctx.measures });
+      }
+    }
+  }
+
+  // Check unquoted column references: Table[Column]
+  const bareTableRefs = Array.from(raw.matchAll(/(?<!')\b([A-Za-z_][\w]*)\[([^\]]+)\]/g));
+  for (const m of bareTableRefs) {
+    const tableName = m[1].trim();
+    const colName = m[2].trim();
+    const bareRef = `${tableName.toLowerCase()}[${colName.toLowerCase()}]`;
+    const quotedRef = `'${tableName.toLowerCase()}'[${colName.toLowerCase()}]`;
+
+    if (!ctx.allColumnRefs.has(bareRef) && !ctx.allColumnRefs.has(quotedRef)) {
+      if (!knownMeasures.has(colName.toLowerCase())) {
+        issues.push(`Unknown field reference: ${tableName}[${colName}].`);
+        log("unknown_bare_table_ref", { bareRef, knownMeasures: ctx.measures });
       }
     }
   }

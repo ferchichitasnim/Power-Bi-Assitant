@@ -12,16 +12,20 @@ import EmptyFileState from "./shared/EmptyFileState";
 import { usePBIX } from "../context/PBIXContext";
 import useOllamaModels from "../hooks/useOllamaModels";
 import useStoryGeneration from "../hooks/useStoryGeneration";
+import { buildStoryInputContext } from "../utils/storyContext";
 
 export default function StorytellingPage() {
   const { pbixContext } = usePBIX();
   const { models } = useOllamaModels();
   const [model, setModel] = useState("llama3.2:3b");
+  const [focus, setFocus] = useState("");
   const outputRef = useRef(null);
 
-  const { story, generate, isGenerating, stop, error } = useStoryGeneration();
+  const { story, generate, isGenerating, stop, error, focusError, clearFocusError } = useStoryGeneration();
 
-  const storyInputContext = pbixContext?.storyContext || pbixContext?.rawContext || null;
+  const storyInputContext = pbixContext
+    ? buildStoryInputContext(pbixContext) || pbixContext.rawContext || null
+    : null;
 
   const handleGenerate = async () => {
     if (!storyInputContext) {
@@ -32,6 +36,7 @@ export default function StorytellingPage() {
     await generate({
       context: storyInputContext,
       model,
+      focus,
     });
   };
 
@@ -50,6 +55,26 @@ export default function StorytellingPage() {
           <>
             <div className="card" style={{ padding: 16, display: "grid", gap: 14 }}>
               <ModelSelector models={models} selected={model} onSelect={setModel} />
+              <div className="card" style={{ padding: 12 }}>
+                <label className="muted" style={{ display: "block", fontSize: 12, marginBottom: 6 }}>
+                  Focus area (optional)
+                </label>
+                <input
+                  type="text"
+                  className="input"
+                  placeholder="e.g. sales per commercial, fact_sale2, employee turnover"
+                  value={focus}
+                  onChange={(e) => {
+                    clearFocusError();
+                    setFocus(e.target.value);
+                  }}
+                />
+                {focusError ? (
+                  <p style={{ color: "#e53e3e", fontSize: "13px", marginTop: "4px" }}>
+                    {focusError}
+                  </p>
+                ) : null}
+              </div>
               <div style={{ display: "flex", justifyContent: "flex-end" }}>
                 <GenerateButton
                   disabled={!storyInputContext}

@@ -35,7 +35,6 @@ export function parseDaxSections(full) {
   const explanation = (logicMatch?.[1] || "").trim();
   const suggestions = (sugMatch?.[1] || "").trim();
 
-  // Fallback: model may not follow exact headings. Try to recover usable output.
   if (!daxCode && !explanation && !suggestions && text.trim()) {
     const codeFence = text.match(/```(?:dax|sql)?\s*([\s\S]*?)```/i);
     if (codeFence?.[1]?.trim()) {
@@ -79,7 +78,7 @@ export default function useDAXGeneration() {
   }, []);
 
   const generate = useCallback(
-    async ({ query, context = "", model = "llama3.2:3b", pbixContext = "", mcpContext = null }) => {
+    async ({ query, context = "", model = "llama3.2:3b", pbixContext = "", mcpContext = null, modelTables = null }) => {
       const q = (query || "").trim();
       if (!q) {
         setError(new Error("Enter a description first."));
@@ -124,7 +123,9 @@ export default function useDAXGeneration() {
             daxContext: context.trim(),
             model,
             pbixContext: typeof pbixContext === "string" ? pbixContext : "",
-            mcpContext,
+            mcpContext: modelTables?.length
+              ? { ...(mcpContext || {}), modelTables }
+              : mcpContext,
           }),
           signal: ctrl.signal,
         });

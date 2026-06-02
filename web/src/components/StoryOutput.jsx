@@ -67,9 +67,16 @@ export default function StoryOutput({ content, loading }) {
 
       {loading && !content && (
         <div className="card" style={{ padding: 12, background: "var(--pbi-surface-alt)" }}>
-          <div className="muted">Initializing story...</div>
+          <div className="muted">Generating story with Ollama…</div>
           <div style={{ height: 6, marginTop: 8, background: "#dfe7f4", borderRadius: 999 }} />
         </div>
+      )}
+
+      {!loading && !content && (
+        <p className="muted" style={{ margin: 0, fontSize: 14 }}>
+          Generated narrative will appear here. If nothing shows after clicking Generate, check the error message above
+          (often Ollama memory or connection).
+        </p>
       )}
 
       {content && (

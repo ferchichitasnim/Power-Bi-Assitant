@@ -21,10 +21,17 @@ function parseSSEEvents(buffer, onEvent) {
   return remainder;
 }
 
+function flushSSEBuffer(buffer, onEvent) {
+  const tail = buffer.trim();
+  if (!tail) return "";
+  return parseSSEEvents(`${tail}\n\n`, onEvent);
+}
+
 export default function useStoryGeneration() {
   const [story, setStory] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState(null);
+  const [focusError, setFocusError] = useState("");
   const abortRef = useRef(null);
 
   const generate = useCallback(async ({ context, model = "llama3.2:3b", focus = "" }) => {
@@ -42,10 +49,24 @@ export default function useStoryGeneration() {
     abortRef.current = ctrl;
     setStory("");
     setError(null);
+    setFocusError("");
     setIsGenerating(true);
 
     const flaskUrl = (process.env.NEXT_PUBLIC_FLASK_URL || "http://127.0.0.1:5052").replace(/\/$/, "");
     let acc = "";
+    let streamError = null;
+
+    const handleEvent = (evt) => {
+      if (evt?.type === "chunk" && typeof evt.text === "string") {
+        acc += evt.text;
+        setStory(acc);
+      } else if (evt?.type === "error") {
+        streamError = new Error(
+          typeof evt.message === "string" ? evt.message : "Story generation failed."
+        );
+      }
+    };
+
     try {
       const res = await fetch(`${flaskUrl}/api/story/generate`, {
         method: "POST",
@@ -58,6 +79,10 @@ export default function useStoryGeneration() {
         let message = text || `HTTP ${res.status}`;
         try {
           const parsed = JSON.parse(text);
+          if (res.status === 400 && parsed?.error_type === "invalid_focus" && typeof parsed.error === "string") {
+            setFocusError(parsed.error);
+            return null;
+          }
           if (parsed?.error && typeof parsed.error === "string") message = parsed.error;
         } catch {
           // Keep raw text.
@@ -72,16 +97,22 @@ export default function useStoryGeneration() {
 
       while (true) {
         const { done, value } = await reader.read();
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+          buffer = parseSSEEvents(buffer, handleEvent);
+        }
+        if (streamError) throw streamError;
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        buffer = parseSSEEvents(buffer, (evt) => {
-          if (evt?.type === "chunk" && typeof evt.text === "string") {
-            acc += evt.text;
-            setStory(acc);
-          } else if (evt?.type === "error") {
-            throw new Error(typeof evt.message === "string" ? evt.message : "Story generation failed.");
-          }
-        });
+      }
+
+      buffer += decoder.decode();
+      flushSSEBuffer(buffer, handleEvent);
+      if (streamError) throw streamError;
+
+      if (!acc.trim()) {
+        throw new Error(
+          "No story was returned. Check that Ollama is running, try a smaller model, or restart Ollama if you see memory errors."
+        );
       }
       return acc;
     } catch (e) {
@@ -99,5 +130,9 @@ export default function useStoryGeneration() {
     abortRef.current?.abort();
   }, []);
 
-  return { story, isGenerating, error, generate, stop };
+  const clearFocusError = useCallback(() => {
+    setFocusError("");
+  }, []);
+
+  return { story, isGenerating, error, focusError, generate, stop, clearFocusError };
 }

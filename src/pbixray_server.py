@@ -38,6 +38,66 @@ PAGE_SIZE = args.page_size
 AUTO_LOAD_FILE = args.load_file
 
 
+# ---------------------------------------------------------------------------
+# Internal Power BI table filtering
+# ---------------------------------------------------------------------------
+def _is_internal_table(name: str) -> bool:
+    """
+    Detect auto-generated Power BI helper tables that should be hidden
+    from user-facing output. These include LocalDateTable_* and
+    DateTableTemplate_* entries.
+    """
+    lower = str(name or "").strip().lower()
+    return "localdatetable_" in lower or "datetabletemplate_" in lower
+
+
+def _filter_table_list(tables):
+    """Filter a list/array of table names, removing internal PBI tables."""
+    if isinstance(tables, np.ndarray):
+        tables = tables.tolist()
+    if not isinstance(tables, list):
+        return tables
+    return [t for t in tables if not _is_internal_table(str(t))]
+
+
+def _filter_df_by_table_column(df, column_name: str, *, drop_none: bool = False):
+    """Filter a pandas DataFrame, removing rows where column_name matches an internal table.
+    
+    If drop_none=True, also removes rows where the column value is None/NaN/empty.
+    This is useful for relationship columns where PBIXRay may store None when the
+    target table is an internal auto-generated table.
+    """
+    if df is None or not hasattr(df, "columns"):
+        return df
+    if column_name not in df.columns:
+        return df
+    
+    def _should_drop(v):
+        s = str(v).strip() if v is not None else ""
+        if _is_internal_table(s):
+            return True
+        if drop_none and (v is None or s == "" or s.lower() == "none" or s.lower() == "nan"):
+            return True
+        return False
+    
+    mask = ~df[column_name].apply(_should_drop)
+    return df[mask]
+
+
+def _filter_df_by_multiple_table_columns(df, column_names: list, *, drop_none: bool = False):
+    """Filter a DataFrame removing rows where ANY of the given columns is an internal table.
+    
+    If drop_none=True, also drops rows where any column is None/empty (for relationships
+    where PBIXRay may store None as the table name for internal auto-generated tables).
+    """
+    if df is None or not hasattr(df, "columns"):
+        return df
+    for col in column_names:
+        if col in df.columns:
+            df = _filter_df_by_table_column(df, col, drop_none=drop_none)
+    return df
+
+
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.ndarray):
@@ -185,7 +245,8 @@ def get_tables(ctx: Context) -> str:
     try:
         tables = current_model.tables
         if isinstance(tables, (list, np.ndarray)):
-            return json.dumps(tables.tolist() if isinstance(tables, np.ndarray) else tables, indent=2)
+            filtered = _filter_table_list(tables)
+            return json.dumps(filtered, indent=2)
         else:
             return str(tables)
     except Exception as e:
@@ -230,6 +291,8 @@ def get_power_query(ctx: Context) -> str:
 
     try:
         power_query = current_model.power_query
+        # Filter out internal tables if TableName column exists
+        power_query = _filter_df_by_table_column(power_query, "TableName")
         return power_query.to_json(orient="records", indent=2)
     except Exception as e:
         ctx.info(f"Error retrieving Power Query: {str(e)}")
@@ -359,6 +422,9 @@ def get_dax_tables(ctx: Context) -> str:
 
     try:
         dax_tables = current_model.dax_tables
+        # Filter out internal tables
+        dax_tables = _filter_df_by_table_column(dax_tables, "TableName")
+        dax_tables = _filter_df_by_table_column(dax_tables, "Name")
         return dax_tables.to_json(orient="records", indent=2)
     except Exception as e:
         ctx.info(f"Error retrieving DAX tables: {str(e)}")
@@ -382,6 +448,9 @@ def get_dax_measures(ctx: Context, table_name: str = None, measure_name: str = N
 
     try:
         dax_measures = current_model.dax_measures
+        # Filter out internal tables
+        dax_measures = _filter_df_by_table_column(dax_measures, "TableName")
+
         if table_name:
             dax_measures = dax_measures[dax_measures["TableName"] == table_name]
         if measure_name:
@@ -419,6 +488,9 @@ def get_dax_columns(ctx: Context, table_name: str = None, column_name: str = Non
 
     try:
         dax_columns = current_model.dax_columns
+        # Filter out internal tables
+        dax_columns = _filter_df_by_table_column(dax_columns, "TableName")
+
         if table_name:
             dax_columns = dax_columns[dax_columns["TableName"] == table_name]
         if column_name:
@@ -456,6 +528,9 @@ def get_schema(ctx: Context, table_name: str = None, column_name: str = None) ->
 
     try:
         schema = current_model.schema
+        # Filter out internal tables
+        schema = _filter_df_by_table_column(schema, "TableName")
+
         if table_name:
             schema = schema[schema["TableName"] == table_name]
         if column_name:
@@ -495,6 +570,12 @@ async def get_relationships(ctx: Context, from_table: str = None, to_table: str 
         def get_filtered_relationships():
             model = current_model
             relationships = model.relationships
+            # Filter out internal tables from both sides, and also drop
+            # rows where either table name is None/empty (PBIXRay stores
+            # None when the target is an internal auto-generated table).
+            relationships = _filter_df_by_multiple_table_columns(
+                relationships, ["FromTableName", "ToTableName"], drop_none=True
+            )
             if from_table:
                 relationships = relationships[relationships["FromTableName"] == from_table]
             if to_table:
@@ -544,6 +625,10 @@ async def get_table_contents(ctx: Context, table_name: str, filters: str = None,
     """
     if current_model is None:
         return "Error: No Power BI file loaded. Please use load_pbix_file first."
+
+    # Block access to internal tables
+    if _is_internal_table(table_name):
+        return f"Error: Table '{table_name}' is an internal Power BI table and cannot be accessed."
 
     try:
         import time
@@ -682,6 +767,9 @@ def get_statistics(ctx: Context, table_name: str = None, column_name: str = None
 
     try:
         statistics = current_model.statistics
+        # Filter out internal tables
+        statistics = _filter_df_by_table_column(statistics, "TableName")
+
         if table_name:
             statistics = statistics[statistics["TableName"] == table_name]
         if column_name:
@@ -718,10 +806,16 @@ async def generate_storytelling_narrative(ctx: Context, model_name: str = None) 
 
     try:
         await ctx.report_progress(10, 100)
+
+        # Use filtered tables for storytelling
+        filtered_tables = _filter_table_list(current_model.tables)
+        statistics = current_model.statistics
+        statistics = _filter_df_by_table_column(statistics, "TableName")
+
         context = build_story_context(
             current_model_path or "unknown.pbix",
-            current_model.tables,
-            current_model.statistics,
+            filtered_tables,
+            statistics,
         )
         await ctx.report_progress(50, 100)
         story = generate_story_with_ollama(context=context, model=model_name)
@@ -755,21 +849,31 @@ async def get_model_summary(ctx: Context) -> str:
 
         await ctx.report_progress(25, 100)
 
-        summary["tables_count"] = len(current_model.tables)
-        summary["tables"] = (
-            current_model.tables.tolist() if isinstance(current_model.tables, np.ndarray) else current_model.tables
-        )
+        # Filter internal tables from the summary
+        filtered_tables = _filter_table_list(current_model.tables)
+        summary["tables_count"] = len(filtered_tables)
+        summary["tables"] = filtered_tables
 
         await ctx.report_progress(50, 100)
 
+        # Filter measures that belong to internal tables
+        dax_measures = current_model.dax_measures
+        if hasattr(dax_measures, "columns") and "TableName" in dax_measures.columns:
+            dax_measures = _filter_df_by_table_column(dax_measures, "TableName")
         summary["measures_count"] = (
-            len(current_model.dax_measures) if hasattr(current_model.dax_measures, "__len__") else "Unknown"
+            len(dax_measures) if hasattr(dax_measures, "__len__") else "Unknown"
         )
 
         await ctx.report_progress(75, 100)
 
+        # Filter relationships involving internal tables
+        relationships = current_model.relationships
+        if hasattr(relationships, "columns"):
+            relationships = _filter_df_by_multiple_table_columns(
+                relationships, ["FromTableName", "ToTableName"], drop_none=True
+            )
         summary["relationships_count"] = (
-            len(current_model.relationships) if hasattr(current_model.relationships, "__len__") else "Unknown"
+            len(relationships) if hasattr(relationships, "__len__") else "Unknown"
         )
 
         await ctx.report_progress(100, 100)

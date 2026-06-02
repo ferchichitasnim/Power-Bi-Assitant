@@ -1,11 +1,14 @@
 "use client";
 
+import { useMemo, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { ArrowRight, BookOpen, Code, Copy, Lightbulb } from "lucide-react";
+import { ArrowRight, BookOpen, Code, Copy, Lightbulb, Loader2, Package } from "lucide-react";
 import { motion } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import toast from "react-hot-toast";
+import { parseDaxMeasures } from "../../utils/parseDaxMeasures";
+import { patchPbixMeasures } from "../../utils/patchPbixMeasures";
 
 function SkeletonBlock() {
   return (
@@ -61,6 +64,11 @@ function mdExplanationComponents() {
   return { code: codeBlock };
 }
 
+function isDimTable(name) {
+  const n = String(name || "").toLowerCase();
+  return n.startsWith("dim_") || n.startsWith("dim ");
+}
+
 function mdSuggestionsComponents() {
   return {
     code: codeBlock,
@@ -75,10 +83,80 @@ function mdSuggestionsComponents() {
   };
 }
 
-export default function DAXOutputCard({ daxCode, explanation, suggestions, isLoading }) {
+export default function DAXOutputCard({
+  daxCode,
+  explanation,
+  suggestions,
+  isLoading,
+  pbixId = null,
+  tables = [],
+}) {
   const showSk1 = isLoading && !String(daxCode || "").trim();
   const showSk2 = isLoading && !String(explanation || "").trim();
   const showSk3 = isLoading && !String(suggestions || "").trim();
+
+  const modelTables = useMemo(
+    () => (tables || []).filter((t) => typeof t === "string" && t.trim()),
+    [tables]
+  );
+
+  const [isPatching, setIsPatching] = useState(false);
+
+  const autoDetectedTable = useMemo(() => {
+    if (!String(daxCode || "").trim() || !modelTables.length) return "";
+
+    // 1. Find explicit Table[Column] references in the DAX code
+    const tableRefs = [...daxCode.matchAll(/(?:'([^']+)'|(\b[A-Za-z_]\w*))\[/g)]
+      .map((m) => m[1] || m[2])
+      .filter((t) => t && modelTables.includes(t));
+
+    // 2. Prefer a fact table if referenced
+    const factRef = tableRefs.find((t) => t.toLowerCase().startsWith("fact_"));
+    if (factRef) return factRef;
+
+    // 3. Otherwise use the first referenced non-dimension table
+    const nonDimRef = tableRefs.find((t) => !isDimTable(t));
+    if (nonDimRef) return nonDimRef;
+    if (tableRefs.length) return tableRefs[0];
+
+    // 4. Bare [MeasureName] only — first fact table, never a dim table by default
+    const firstFact = modelTables.find((t) => t.toLowerCase().startsWith("fact_"));
+    if (firstFact) return firstFact;
+
+    // 5. Last resort: first non-dimension table
+    return modelTables.find((t) => !isDimTable(t)) || "";
+  }, [daxCode, modelTables]);
+
+  const canApply = Boolean(pbixId && daxCode?.trim() && autoDetectedTable && !isPatching);
+
+  const handleApplyToPbix = async () => {
+    if (!pbixId || !daxCode?.trim()) return;
+
+    const parsed = parseDaxMeasures(daxCode, autoDetectedTable, modelTables);
+    if (!parsed.length) {
+      toast.error("Could not parse DAX. Use format: Measure Name = SUM(Table[Column])");
+      return;
+    }
+
+    const measures = parsed.map((m) => ({ ...m, table_name: autoDetectedTable || m.table_name }));
+
+    setIsPatching(true);
+    try {
+      const method = await patchPbixMeasures(pbixId, measures);
+      if (method === "direct") {
+        toast.success("Patched PBIX downloaded — open it in Power BI Desktop");
+      } else {
+        toast(
+          "This PBIX format doesn't support direct patching. A Tabular Editor script was downloaded instead — open it in Tabular Editor while your model is open in Power BI Desktop.",
+          { icon: "ℹ️", duration: 8000 }
+        );
+      }
+    } catch (err) {
+      toast.error(err?.message || "Failed to patch PBIX");
+    } finally {
+      setIsPatching(false);
+    }
+  };
 
   return (
     <div style={{ display: "grid", gap: 16, minHeight: 0 }}>
@@ -97,16 +175,40 @@ export default function DAXOutputCard({ daxCode, explanation, suggestions, isLoa
             <Code size={18} color="var(--pbi-primary)" />
             <strong style={{ fontSize: 15 }}>Generated DAX</strong>
           </div>
-          <button
-            type="button"
-            className="button"
-            style={{ padding: "6px 10px", fontSize: 12, height: "auto", background: "var(--pbi-surface-alt)", color: "var(--pbi-text)" }}
-            disabled={!daxCode?.trim()}
-            onClick={() => copyRaw(daxCode)}
-          >
-            <Copy size={14} style={{ marginRight: 6, verticalAlign: "middle" }} />
-            Copy
-          </button>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end" }}>
+            {pbixId && (
+              <button
+                type="button"
+                className="button"
+                style={{
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  height: "auto",
+                  background: "var(--pbi-primary)",
+                  color: "#fff",
+                }}
+                disabled={!canApply}
+                onClick={handleApplyToPbix}
+              >
+                {isPatching ? (
+                  <Loader2 size={14} className="dax-spin" style={{ marginRight: 6, verticalAlign: "middle" }} />
+                ) : (
+                  <Package size={14} style={{ marginRight: 6, verticalAlign: "middle" }} />
+                )}
+                {isPatching ? "Applying…" : "Apply to PBIX"}
+              </button>
+            )}
+            <button
+              type="button"
+              className="button"
+              style={{ padding: "6px 10px", fontSize: 12, height: "auto", background: "var(--pbi-surface-alt)", color: "var(--pbi-text)" }}
+              disabled={!daxCode?.trim()}
+              onClick={() => copyRaw(daxCode)}
+            >
+              <Copy size={14} style={{ marginRight: 6, verticalAlign: "middle" }} />
+              Copy
+            </button>
+          </div>
         </div>
         {showSk1 ? (
           <SkeletonBlock />

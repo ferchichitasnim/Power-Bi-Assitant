@@ -107,6 +107,10 @@ async function callLlmForDax(
       .replace(/\s*```$/i, "")
       .trim();
 
+    // Fix dot notation -> bracket notation (e.g. 'Table.Column' -> Table[Column] or Table.Column -> Table[Column])
+    cleaned = cleaned.replace(/'([^']+)\.([^']+)'/g, "$1[$2]");
+    cleaned = cleaned.replace(/(\b[A-Za-z_]\w*)\.([A-Za-z_]\w*(?:\$)?)\b(?!\s*[.(])/g, "$1[$2]");
+
     return { dax: cleaned };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

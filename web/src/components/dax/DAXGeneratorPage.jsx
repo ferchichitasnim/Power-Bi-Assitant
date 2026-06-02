@@ -26,11 +26,13 @@ export default function DAXGeneratorPage() {
       query,
       model,
       pbixContext: pbixContext?.rawContext || "",
+      modelTables: pbixContext?.modelTables || [],
       mcpContext: {
         tables: pbixContext?.tables || [],
         columns: pbixContext?.columns || {},
         measures: pbixContext?.measures || [],
         relationships: pbixContext?.relationships || [],
+        modelTables: pbixContext?.modelTables || [],
       },
     });
   };
@@ -108,6 +110,8 @@ export default function DAXGeneratorPage() {
             explanation={explanation}
             suggestions={suggestions}
             isLoading={isLoading}
+            pbixId={pbixContext?.pbixId}
+            tables={pbixContext?.tables}
           />
         </div>
       </div>

@@ -1,26 +1,60 @@
-import { DaxModeRequest, SemanticModelContext } from "./types";
+import { DaxModeRequest, ModelTableForPrompt, SemanticModelContext } from "./types";
 
 // ─── Console logging helper ───────────────────────────────────
 function log(stage: string, data: unknown) {
   console.log(`\n[MCP Client][${stage}]`, JSON.stringify(data, null, 2));
 }
 
+function modelTablesFromPayload(raw: Partial<SemanticModelContext>): ModelTableForPrompt[] {
+  if (!Array.isArray(raw.modelTables) || raw.modelTables.length === 0) return [];
+  return raw.modelTables
+    .map((t) => ({
+      name: String(t?.name || "").trim(),
+      columns: Array.isArray(t?.columns) ? t.columns.map((c) => String(c).trim()).filter(Boolean) : [],
+      measures: Array.isArray(t?.measures) ? t.measures.map((m) => String(m).trim()).filter(Boolean) : [],
+    }))
+    .filter((t) => t.name);
+}
+
 function normalizeContext(raw: Partial<SemanticModelContext>, source: "mcp" | "mock"): SemanticModelContext {
-  const tables = Array.isArray(raw.tables) ? raw.tables.map((x) => String(x).trim()).filter(Boolean) : [];
+  const modelTables = modelTablesFromPayload(raw);
+
+  let tables = Array.isArray(raw.tables) ? raw.tables.map((x) => String(x).trim()).filter(Boolean) : [];
   const columnsObj = raw.columns && typeof raw.columns === "object" ? raw.columns : {};
-  const columns: Record<string, string[]> = {};
+  let columns: Record<string, string[]> = {};
   for (const [table, cols] of Object.entries(columnsObj || {})) {
     if (!Array.isArray(cols)) continue;
     const clean = cols.map((c) => String(c).trim()).filter(Boolean);
     if (clean.length) columns[String(table).trim()] = clean;
   }
-  const measures = Array.isArray(raw.measures) ? raw.measures.map((x) => String(x).trim()).filter(Boolean) : [];
+  let measures = Array.isArray(raw.measures) ? raw.measures.map((x) => String(x).trim()).filter(Boolean) : [];
   const relationships = Array.isArray(raw.relationships)
     ? raw.relationships.map((x) => String(x).trim()).filter(Boolean)
     : [];
 
-  log("normalizeContext", { source, tables, columnCount: Object.keys(columns).length, measures, relationships });
-  return { source, tables, columns, measures, relationships };
+  if (modelTables.length > 0) {
+    if (!tables.length) tables = modelTables.map((t) => t.name);
+    for (const t of modelTables) {
+      if (t.columns.length && !columns[t.name]?.length) {
+        columns[t.name] = t.columns;
+      }
+    }
+    if (!measures.length) {
+      measures = modelTables.flatMap((t) =>
+        t.measures.map((m) => (t.name ? `${t.name}[${m}]` : m))
+      );
+    }
+  }
+
+  log("normalizeContext", {
+    source,
+    tables,
+    columnCount: Object.keys(columns).length,
+    measures,
+    relationships,
+    modelTableCount: modelTables.length,
+  });
+  return { source, tables, columns, measures, relationships, modelTables };
 }
 
 export async function getMcpSemanticModelContext(input: DaxModeRequest): Promise<SemanticModelContext> {
@@ -28,7 +62,7 @@ export async function getMcpSemanticModelContext(input: DaxModeRequest): Promise
   if (input.mcpContext) {
     log("source:payload", "Trying mcpContext from request body");
     const fromPayload = normalizeContext(input.mcpContext, "mcp");
-    if (fromPayload.tables.length > 0) {
+    if (fromPayload.tables.length > 0 || (fromPayload.modelTables?.length ?? 0) > 0) {
       log("source:payload", "SUCCESS — using mcpContext from request body");
       return fromPayload;
     }
