@@ -120,6 +120,7 @@ from mcp.client.stdio import stdio_client
 from pbixray import PBIXRay
 from pbix_patcher import PBIXPatcher, PBIXPatcherError
 from pbix_upload_store import cleanup_old_uploads, get_upload, register_upload, upload_dir
+from pbi_desktop_connector import inject_measures_into_pbi_desktop
 from documentation_pdf import (
     assemble_reportlab_document,
     build_deterministic_enrichment,
@@ -1370,33 +1371,69 @@ def _normalize_patch_measures(raw: Any) -> list[dict[str, str]]:
     return out
 
 
-def _patch_measures_tabular_script(
-    patcher: PBIXPatcher,
+def _patch_measures_tabular_script_response(
+    pbix_path: str,
     measures: list[dict[str, str]],
     original_filename: str,
 ) -> Response:
-    script = patcher.generate_tabular_editor_script(
-        [
-            {
-                "table_name": m["table_name"],
-                "measure_name": m["measure_name"],
-                "dax_expression": m["dax_expression"],
-                "format_string": m.get("format_string", ""),
-                "description": m.get("description", ""),
-            }
-            for m in measures
-        ]
-    )
+    """Tabular Editor script fallback — does not require DataModelSchema / extract()."""
+    patcher = PBIXPatcher(pbix_path)
     stem = Path(original_filename).stem or "model"
-    download_name = f"{stem}_measures.csx"
-    return Response(
-        script,
+    script_path = Path(tempfile.gettempdir()) / f"{stem}_measures.csx"
+    try:
+        script = patcher.generate_tabular_editor_script(
+            [
+                {
+                    "table_name": m["table_name"],
+                    "measure_name": m["measure_name"],
+                    "dax_expression": m["dax_expression"],
+                    "format_string": m.get("format_string", ""),
+                    "description": m.get("description", ""),
+                }
+                for m in measures
+            ]
+        )
+        script_path.write_text(script, encoding="utf-8")
+    finally:
+        patcher.cleanup()
+
+    @after_this_request
+    def _remove_script_file(response):  # noqa: ANN001
+        try:
+            script_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return response
+
+    response = send_file(
+        str(script_path),
         mimetype="text/plain",
-        headers={
-            "Content-Disposition": f'attachment; filename="{download_name}"',
-            "X-Patch-Method": "tabular-editor-script",
-        },
+        as_attachment=True,
+        download_name=f"{stem}_measures.csx",
     )
+    response.headers["X-Patch-Method"] = "tabular-editor-script"
+    return response
+
+
+@app.post("/api/pbix/inject-measures")
+def api_pbix_inject_measures():
+    """Inject DAX measures directly into a running Power BI Desktop instance."""
+    body = request.get_json(silent=True) or {}
+    measures = body.get("measures") or []
+
+    if not measures:
+        return jsonify({"ok": False, "error": "No measures provided"}), 400
+
+    try:
+        measures = _normalize_patch_measures(measures)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    result = inject_measures_into_pbi_desktop(measures)
+
+    if result.get("ok"):
+        return jsonify(result), 200
+    return jsonify(result), 422
 
 
 @app.post("/api/pbix/patch-measures")
@@ -1413,7 +1450,7 @@ def api_pbix_patch_measures():
 
     meta = get_upload(pbix_id)
     if not meta:
-        return jsonify({"ok": False, "error": "Unknown or expired pbix_id. Re-upload the file."}), 404
+        return jsonify({"ok": False, "error": "PBIX file not found or expired. Re-upload the file."}), 404
 
     pbix_path = Path(meta["file_path"])
     if not pbix_path.exists():
@@ -1421,68 +1458,58 @@ def api_pbix_patch_measures():
 
     original_filename = str(meta.get("original_filename") or pbix_path.name)
     stem = Path(original_filename).stem or "model"
+    pbix_path_str = str(pbix_path)
 
-    patcher = PBIXPatcher(str(pbix_path))
+    patcher = PBIXPatcher(pbix_path_str)
     try:
         patcher.extract()
-    except PBIXPatcherError as exc:
-        if "DataModelSchema not found" in str(exc):
-            logger.info("[patch] DataModelSchema missing; returning Tabular Editor script pbix_id=%s", pbix_id)
+
+        batch_measures = [{**m, "overwrite": True} for m in measures]
+        patcher.batch_add_measures(batch_measures)
+        output_path = patcher.repackage(str(upload_dir() / f"{pbix_id}_patched.pbix"))
+
+        @after_this_request
+        def _remove_patched_file(response):  # noqa: ANN001
             try:
-                return _patch_measures_tabular_script(patcher, measures, original_filename)
-            finally:
-                patcher.cleanup()
-        patcher.cleanup()
-        logger.exception("[patch] extract failed pbix_id=%s", pbix_id)
-        return jsonify({"ok": False, "error": str(exc)}), 500
-    except Exception as exc:
-        patcher.cleanup()
-        logger.exception("[patch] extract failed pbix_id=%s", pbix_id)
-        return jsonify({"ok": False, "error": str(exc)}), 500
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return response
 
-    try:
-        for m in measures:
-            patcher.add_measure(
-                table_name=m["table_name"],
-                measure_name=m["measure_name"],
-                dax_expression=m["dax_expression"],
-                format_string=m.get("format_string", ""),
-                description=m.get("description", ""),
-                display_folder=m.get("display_folder", ""),
-                overwrite=True,
-            )
-        output_path = patcher.repackage(
-            str(upload_dir() / f"{pbix_id}_patched.pbix")
+        response = send_file(
+            output_path,
+            as_attachment=True,
+            download_name=f"{stem}_patched.pbix",
+            mimetype="application/octet-stream",
         )
-    except PBIXPatcherError as exc:
-        patcher.cleanup()
-        return jsonify({"ok": False, "error": str(exc)}), 400
+        response.headers["X-Patch-Method"] = "direct"
+        return response
+
     except Exception as exc:
-        patcher.cleanup()
-        logger.exception("[patch] apply/repackage failed pbix_id=%s", pbix_id)
-        return jsonify({"ok": False, "error": str(exc)}), 500
-
-    download_name = f"{stem}_patched.pbix"
-
-    @after_this_request
-    def _remove_patched_file(response):  # noqa: ANN001
+        error_msg = str(exc)
+        logger.info(
+            "[patch] Direct patching failed pbix_id=%s: %s — falling back to Tabular Editor script",
+            pbix_id,
+            error_msg,
+        )
         try:
-            output_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            return _patch_measures_tabular_script_response(pbix_path_str, measures, original_filename)
+        except Exception as fallback_err:
+            logger.exception("[patch] script fallback failed pbix_id=%s", pbix_id)
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": f"Both patching and script generation failed: {fallback_err}",
+                    }
+                ),
+                500,
+            )
+    finally:
         try:
             patcher.cleanup()
         except Exception:
             pass
-        return response
-
-    return send_file(
-        output_path,
-        as_attachment=True,
-        download_name=download_name,
-        mimetype="application/octet-stream",
-        headers={"X-Patch-Method": "direct"},
-    )
 
 
 @app.post("/api/pbix/open-uploaded")

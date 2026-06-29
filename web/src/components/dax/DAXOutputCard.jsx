@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { ArrowRight, BookOpen, Code, Copy, Lightbulb, Loader2, Package } from "lucide-react";
+import { BookOpen, Code, Copy, Loader2, Package } from "lucide-react";
 import { motion } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import toast from "react-hot-toast";
@@ -69,31 +69,15 @@ function isDimTable(name) {
   return n.startsWith("dim_") || n.startsWith("dim ");
 }
 
-function mdSuggestionsComponents() {
-  return {
-    code: codeBlock,
-    li({ children }) {
-      return (
-        <li style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 8 }}>
-          <ArrowRight size={16} color="var(--pbi-purple)" style={{ flexShrink: 0, marginTop: 2 }} />
-          <span style={{ flex: 1 }}>{children}</span>
-        </li>
-      );
-    },
-  };
-}
-
 export default function DAXOutputCard({
   daxCode,
   explanation,
-  suggestions,
   isLoading,
   pbixId = null,
   tables = [],
 }) {
   const showSk1 = isLoading && !String(daxCode || "").trim();
   const showSk2 = isLoading && !String(explanation || "").trim();
-  const showSk3 = isLoading && !String(suggestions || "").trim();
 
   const modelTables = useMemo(
     () => (tables || []).filter((t) => typeof t === "string" && t.trim()),
@@ -143,11 +127,13 @@ export default function DAXOutputCard({
     setIsPatching(true);
     try {
       const method = await patchPbixMeasures(pbixId, measures);
-      if (method === "direct") {
+      if (method === "live-inject") {
+        toast.success("Measure injected directly into Power BI Desktop! Check your model.");
+      } else if (method === "direct") {
         toast.success("Patched PBIX downloaded — open it in Power BI Desktop");
       } else {
         toast(
-          "This PBIX format doesn't support direct patching. A Tabular Editor script was downloaded instead — open it in Tabular Editor while your model is open in Power BI Desktop.",
+          "This PBIX format doesn't support direct patching. A Tabular Editor script was downloaded instead.",
           { icon: "ℹ️", duration: 8000 }
         );
       }
@@ -254,29 +240,6 @@ export default function DAXOutputCard({
         ) : (
           <div className="dax-md" style={{ fontSize: 14, lineHeight: 1.55 }}>
             <ReactMarkdown components={mdExplanationComponents()}>{explanation || "_Waiting for explanation…_"}</ReactMarkdown>
-          </div>
-        )}
-      </motion.div>
-
-      <motion.div
-        className="card"
-        initial={{ opacity: 0, y: 4 }}
-        animate={{ opacity: 1, y: 0 }}
-        style={{
-          borderLeft: "3px solid var(--pbi-purple)",
-          padding: 14,
-          background: "var(--pbi-surface-alt)",
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-          <Lightbulb size={18} color="var(--pbi-purple)" />
-          <strong style={{ fontSize: 15 }}>Suggestions &amp; Variants</strong>
-        </div>
-        {showSk3 ? (
-          <SkeletonBlock />
-        ) : (
-          <div className="dax-md" style={{ fontSize: 14, lineHeight: 1.55 }}>
-            <ReactMarkdown components={mdSuggestionsComponents()}>{suggestions || "_Waiting for suggestions…_"}</ReactMarkdown>
           </div>
         )}
       </motion.div>

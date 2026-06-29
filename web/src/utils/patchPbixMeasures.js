@@ -11,13 +11,37 @@ function triggerBlobDownload(blob, filename) {
   URL.revokeObjectURL(url);
 }
 
+function flaskBase() {
+  return (process.env.NEXT_PUBLIC_FLASK_URL || "http://127.0.0.1:5052").replace(/\/$/, "");
+}
+
 /**
- * POST measures to Flask and download patched .pbix or Tabular Editor script.
+ * Try live PBI Desktop injection, then file-based patch / Tabular Editor script.
  *
- * @returns {Promise<"direct" | "tabular-editor-script">}
+ * @returns {Promise<"live-inject" | "direct" | "tabular-editor-script">}
  */
 export async function patchPbixMeasures(pbixId, measures) {
-  const flask = (process.env.NEXT_PUBLIC_FLASK_URL || "http://127.0.0.1:5052").replace(/\/$/, "");
+  const flask = flaskBase();
+
+  // 1. Try live injection into running PBI Desktop
+  try {
+    const injectRes = await fetch(`${flask}/api/pbix/inject-measures`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ measures }),
+    });
+
+    if (injectRes.ok) {
+      const data = await injectRes.json();
+      if (data.ok) {
+        return "live-inject";
+      }
+    }
+  } catch {
+    // Network error — fall through to file-based patching
+  }
+
+  // 2. Fall back to file-based patching / Tabular Editor script
   const res = await fetch(`${flask}/api/pbix/patch-measures`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -27,8 +51,8 @@ export async function patchPbixMeasures(pbixId, measures) {
   if (!res.ok) {
     let message = `Patch failed (${res.status})`;
     try {
-      const data = await res.json();
-      if (data?.error) message = String(data.error);
+      const err = await res.json();
+      if (err?.error) message = String(err.error);
     } catch {
       /* binary or empty body */
     }

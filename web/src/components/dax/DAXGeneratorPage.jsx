@@ -19,7 +19,7 @@ export default function DAXGeneratorPage() {
   const { models } = useOllamaModels();
   const [model, setModel] = useState("llama3.2:3b");
 
-  const { daxCode, explanation, suggestions, isLoading, error, generate, stop } = useDAXGeneration();
+  const { daxCode, explanation, isLoading, error, generate, stop } = useDAXGeneration();
 
   const onGenerate = async () => {
     await generate({
@@ -44,7 +44,7 @@ export default function DAXGeneratorPage() {
       <div style={{ display: "grid", gap: 18 }}>
         <Header
           title="DAX Generator"
-          subtitle="Turn plain-language business requests into DAX measures with explanation and suggestions."
+          subtitle="Turn plain-language business requests into DAX measures with explanation."
           icon={<Zap size={24} color="var(--pbi-primary)" />}
         />
         <motion.div initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} style={{ marginTop: 20 }}>
@@ -108,7 +108,6 @@ export default function DAXGeneratorPage() {
           <DAXOutputCard
             daxCode={daxCode}
             explanation={explanation}
-            suggestions={suggestions}
             isLoading={isLoading}
             pbixId={pbixContext?.pbixId}
             tables={pbixContext?.tables}

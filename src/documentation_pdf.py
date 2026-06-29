@@ -17,10 +17,18 @@ logger = logging.getLogger(__name__)
 
 from documentation_reportlab import SECTION_BUILDERS, build_reportlab_pdf
 
-DEFAULT_MODEL = "llama3.2:3b"
+DEFAULT_MODEL = "qwen2.5:7b"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 LLM_TIMEOUT_SEC = 360
 LLM_TEMPERATURE = 0.3
+
+
+def _pdf_ollama_model() -> str:
+    """Model for documentation PDF enrichment (DOC_PDF_OLLAMA_MODEL overrides default)."""
+    explicit = str(os.environ.get("DOC_PDF_OLLAMA_MODEL") or "").strip()
+    if explicit:
+        return explicit
+    return DEFAULT_MODEL
 
 CARDINALITY_MAP = {0: "None", 1: "One", 2: "Many"}
 DIRECTION_MAP = {1: "Single", 2: "Both", 3: "Automatic"}
@@ -871,7 +879,7 @@ def prepare_pdf_context(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "filename": filename,
         "generated_at": dt.datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "model_name": str(os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)).strip() or DEFAULT_MODEL,
+        "model_name": _pdf_ollama_model(),
         "data_source_label": _format_data_source_label(source_rows, sources_raw),
         "kpis": {
             "tables": len(business_tables),
@@ -937,7 +945,7 @@ def enrich_documentation_json(ctx: dict[str, Any]) -> dict[str, Any]:
     ctx["enrichment"] = deterministic
     merged: dict[str, Any] = dict(deterministic)
 
-    model = str(os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
+    model = _pdf_ollama_model()
     base_url = str(os.environ.get("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL)).strip() or DEFAULT_OLLAMA_BASE_URL
     try:
         raw = _call_ollama_generate(_build_llm_audit_prompt(ctx), model, base_url)

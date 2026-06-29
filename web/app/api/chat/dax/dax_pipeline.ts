@@ -5,6 +5,7 @@ import { parseDaxIntent } from "./intent_parser";
 import { DaxModeRequest, ReducedDaxContext, ParsedIntent } from "./types";
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateText } from "ai";
+import { tryFilterFallback } from "./filter_fallback";
 
 // ─── Console logging helper ───────────────────────────────────
 function log(stage: string, data: unknown) {
@@ -57,11 +58,14 @@ ${relsSection}
 ## CRITICAL RULES
 1. ONLY reference tables and columns that exist in the schema above. NEVER invent tables or columns.
 2. If a measure already exists (listed above), reference it with [MeasureName] instead of recalculating.
-3. Use DIVIDE() instead of "/" to handle divide-by-zero safely.
-4. Use proper DAX syntax: table names in single quotes, column names in square brackets.
-5. The output must be ONLY the DAX formula. No markdown, no explanation, no code fences.
-6. Format: MeasureName = <expression>
-7. If the user's request CANNOT be answered with the tables and columns in this schema, respond with EXACTLY: ERROR: The requested metric cannot be calculated from the available data model. Available tables: [list the table names]. Do NOT invent columns or tables that are not listed above.
+3. NEVER just rename or alias an existing measure. For example "Gross Margin = [MBM_MargeBenifMoy]" is WRONG. Always write a new calculation.
+4. For "Gross Margin" or "Marge Brute": the correct formula is Revenue minus Cost. In this model that means [Revenu] - [cout].
+5. The measure name MUST be exactly what the user typed, with spaces. NOT with underscores, NOT an existing measure name.
+6. Use DIVIDE() instead of "/" to handle divide-by-zero safely.
+7. Use proper DAX syntax: table names in single quotes, column names in square brackets.
+8. The output must be ONLY the DAX formula. No markdown, no explanation, no code fences.
+9. Format: MeasureName = <expression>
+10. If the user's request CANNOT be answered with the tables and columns in this schema, respond with EXACTLY: ERROR: The requested metric cannot be calculated from the available data model. Available tables: [list the table names]. Do NOT invent columns or tables that are not listed above.
 
 ## Example output format
 Hiring Rate =
@@ -145,18 +149,6 @@ function buildExplanation(dax: string, ctx: ReducedDaxContext): string {
   return lines.join("\n");
 }
 
-function buildSuggestions(dax: string, ctx: ReducedDaxContext): string {
-  const suggestions: string[] = ["- Keep this as a base measure and reuse it in visuals."];
-
-  if (ctx.dateTables.length > 0 && !/\bDate\b/i.test(dax)) {
-    suggestions.push("- Consider adding a date filter variant for period-specific analysis.");
-  }
-  if (!/\bCALCULATE\b/i.test(dax)) {
-    suggestions.push("- Wrap with `CALCULATE()` if you need to apply slicer-independent filters.");
-  }
-  return suggestions.join("\n");
-}
-
 // ─── Main pipeline ────────────────────────────────────────────
 export async function runMcpFirstDaxPipeline(input: DaxModeRequest) {
   log("pipeline:start", {
@@ -218,16 +210,31 @@ export async function runMcpFirstDaxPipeline(input: DaxModeRequest) {
   log("pipeline:validation", validation);
 
   if (!validation.ok) {
+    // Template fallback for filter measures
+    const fallbackDax = tryFilterFallback(input.prompt, reduced);
+    if (fallbackDax) {
+      log("pipeline:template_fallback", fallbackDax);
+      const fbValidation = validateDax(fallbackDax, intent, reduced);
+      if (fbValidation.ok) {
+        llmResult.dax = fallbackDax;
+        // Don't return error — skip to output formatting below
+      }
+    }
+
+    // Only return error if fallback also didn't produce valid DAX
+    const finalCheck = validateDax(llmResult.dax, intent, reduced);
+    if (!finalCheck.ok) {
     return {
       ok: false as const,
       status: 422,
       error: `Generated DAX references fields not in your data model: ${validation.issues.join(" | ")}`,
     };
+    }
+    // Otherwise fall through to output formatting
   }
 
   // 7. Format the output
   const explanation = buildExplanation(llmResult.dax, reduced);
-  const suggestions = buildSuggestions(llmResult.dax, reduced);
 
   const payload = `## DAX Measure
 \`\`\`dax
@@ -235,12 +242,7 @@ ${llmResult.dax}
 \`\`\`
 
 ## How it works
-${explanation}
-
-## Suggestions & Variants
-${suggestions}
-
-_Context source: ${reduced.source.toUpperCase()}_`;
+${explanation}`;
 
   log("pipeline:done", { daxLength: llmResult.dax.length, source: reduced.source });
 
