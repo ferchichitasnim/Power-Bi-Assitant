@@ -30,15 +30,26 @@ def find_pbi_desktop_port() -> int | None:
     # Multiple possible paths where PBI Desktop stores the port file
     search_patterns = [
         # Standard Power BI Desktop
-        os.path.join(local_app_data, "Microsoft", "Power BI Desktop",
-                     "AnalysisServicesWorkspaces", "AnalysisServicesWorkspace_*",
-                     "Data", "msmdsrv.port.txt"),
+        os.path.join(
+            local_app_data,
+            "Microsoft",
+            "Power BI Desktop",
+            "AnalysisServicesWorkspaces",
+            "AnalysisServicesWorkspace_*",
+            "Data",
+            "msmdsrv.port.txt",
+        ),
         # Microsoft Store version
-        os.path.join(local_app_data, "Packages",
-                     "Microsoft.MicrosoftPowerBIDesktop_*",
-                     "LocalState", "AnalysisServicesWorkspaces",
-                     "AnalysisServicesWorkspace_*",
-                     "Data", "msmdsrv.port.txt"),
+        os.path.join(
+            local_app_data,
+            "Packages",
+            "Microsoft.MicrosoftPowerBIDesktop_*",
+            "LocalState",
+            "AnalysisServicesWorkspaces",
+            "AnalysisServicesWorkspace_*",
+            "Data",
+            "msmdsrv.port.txt",
+        ),
         # Broad fallback — search entire LOCALAPPDATA
         os.path.join(local_app_data, "**", "msmdsrv.port.txt"),
     ]
@@ -224,10 +235,7 @@ def inject_measures_into_pbi_desktop(measures: list[dict]) -> dict:
         return {
             "ok": False,
             "method": "none",
-            "error": (
-                "Power BI Desktop is not running or no model is open. "
-                "Open your .pbix in Power BI Desktop first."
-            ),
+            "error": ("Power BI Desktop is not running or no model is open. " "Open your .pbix in Power BI Desktop first."),
         }
 
     return apply_measures_via_powershell(port, measures)

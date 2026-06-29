@@ -50,6 +50,7 @@ from typing import Optional
 
 class PBIXPatcherError(Exception):
     """Base exception for PBIX patching errors."""
+
     pass
 
 
@@ -163,13 +164,15 @@ class PBIXPatcher:
             if table_name and table["name"] != table_name:
                 continue
             for m in table.get("measures", []):
-                results.append({
-                    "table": table["name"],
-                    "name": m["name"],
-                    "expression": m.get("expression", ""),
-                    "description": m.get("description", ""),
-                    "formatString": m.get("formatString", ""),
-                })
+                results.append(
+                    {
+                        "table": table["name"],
+                        "name": m["name"],
+                        "expression": m.get("expression", ""),
+                        "description": m.get("description", ""),
+                        "formatString": m.get("formatString", ""),
+                    }
+                )
         return results
 
     def get_model_context(self) -> dict:
@@ -180,26 +183,24 @@ class PBIXPatcher:
         self._ensure_extracted()
         tables = []
         for t in self.model_schema["model"]["tables"]:
-            tables.append({
-                "name": t["name"],
-                "columns": [
-                    {"name": c["name"], "dataType": c.get("dataType", "unknown")}
-                    for c in t.get("columns", [])
-                ],
-                "measures": [
-                    {"name": m["name"], "expression": m.get("expression", "")}
-                    for m in t.get("measures", [])
-                ],
-                "relationships_hint": "see model.relationships",
-            })
+            tables.append(
+                {
+                    "name": t["name"],
+                    "columns": [{"name": c["name"], "dataType": c.get("dataType", "unknown")} for c in t.get("columns", [])],
+                    "measures": [{"name": m["name"], "expression": m.get("expression", "")} for m in t.get("measures", [])],
+                    "relationships_hint": "see model.relationships",
+                }
+            )
         relationships = []
         for r in self.model_schema.get("model", {}).get("relationships", []):
-            relationships.append({
-                "fromTable": r.get("fromTable"),
-                "fromColumn": r.get("fromColumn"),
-                "toTable": r.get("toTable"),
-                "toColumn": r.get("toColumn"),
-            })
+            relationships.append(
+                {
+                    "fromTable": r.get("fromTable"),
+                    "fromColumn": r.get("fromColumn"),
+                    "toTable": r.get("toTable"),
+                    "toColumn": r.get("toColumn"),
+                }
+            )
         return {"tables": tables, "relationships": relationships}
 
     # ──────────────────────────────────────────────
@@ -212,9 +213,7 @@ class PBIXPatcher:
             if t["name"] == table_name:
                 return t
         available = [t["name"] for t in self.model_schema["model"]["tables"]]
-        raise PBIXPatcherError(
-            f"Table '{table_name}' not found. Available tables: {available}"
-        )
+        raise PBIXPatcherError(f"Table '{table_name}' not found. Available tables: {available}")
 
     def add_measure(
         self,
@@ -262,9 +261,7 @@ class PBIXPatcher:
             measure["displayFolder"] = display_folder
 
         if not format_string:
-            measure["annotations"] = [
-                {"name": "PBI_FormatHint", "value": json.dumps({"isGeneralNumber": True})}
-            ]
+            measure["annotations"] = [{"name": "PBI_FormatHint", "value": json.dumps({"isGeneralNumber": True})}]
 
         table["measures"].append(measure)
         return measure
@@ -294,9 +291,7 @@ class PBIXPatcher:
                     m["displayFolder"] = new_display_folder
                 return m
 
-        raise PBIXPatcherError(
-            f"Measure '{measure_name}' not found in table '{table_name}'."
-        )
+        raise PBIXPatcherError(f"Measure '{measure_name}' not found in table '{table_name}'.")
 
     def remove_measure(self, table_name: str, measure_name: str) -> bool:
         """Remove a measure. Returns True if found and removed.
@@ -311,9 +306,7 @@ class PBIXPatcher:
             if m["name"] == measure_name:
                 measures.pop(i)
                 return True
-        raise PBIXPatcherError(
-            f"Measure '{measure_name}' not found in table '{table_name}'."
-        )
+        raise PBIXPatcherError(f"Measure '{measure_name}' not found in table '{table_name}'.")
 
     def add_calculated_column(
         self,
@@ -332,9 +325,7 @@ class PBIXPatcher:
 
         for c in table["columns"]:
             if c["name"] == column_name:
-                raise PBIXPatcherError(
-                    f"Column '{column_name}' already exists in '{table_name}'."
-                )
+                raise PBIXPatcherError(f"Column '{column_name}' already exists in '{table_name}'.")
 
         column = {
             "name": column_name,
@@ -445,9 +436,7 @@ class PBIXPatcher:
     # Tabular Editor script generation (alternative)
     # ──────────────────────────────────────────────
 
-    def generate_tabular_editor_script(
-        self, measures: list[dict], output_path: Optional[str] = None
-    ) -> str:
+    def generate_tabular_editor_script(self, measures: list[dict], output_path: Optional[str] = None) -> str:
         """
         Generate a C# script for Tabular Editor that adds/updates measures.
         This is an alternative approach: instead of modifying the .pbix directly,
@@ -480,14 +469,14 @@ class PBIXPatcher:
             lines.append(f'    var tableName = "{table}";')
             lines.append(f'    var measureName = "{name}";')
             lines.append(f'    var daxExpression = "{dax}";')
-            lines.append(f'    var table = Model.Tables[tableName];')
+            lines.append(f"    var table = Model.Tables[tableName];")
             lines.append(f"")
             lines.append(f"    Measure measure;")
             lines.append(f"    if (table.Measures.Contains(measureName)) {{")
             lines.append(f"        measure = table.Measures[measureName];")
-            lines.append(f'        measure.Expression = daxExpression;')
+            lines.append(f"        measure.Expression = daxExpression;")
             lines.append(f"    }} else {{")
-            lines.append(f'        measure = table.AddMeasure(measureName, daxExpression);')
+            lines.append(f"        measure = table.AddMeasure(measureName, daxExpression);")
             lines.append(f"    }}")
             if fmt:
                 lines.append(f'    measure.FormatString = "{fmt}";')

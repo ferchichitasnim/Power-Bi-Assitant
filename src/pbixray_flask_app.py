@@ -66,18 +66,12 @@ def _friendly_ollama_error(exc: Exception, base_url: str, model: str | None = No
     if isinstance(exc, urllib.error.URLError):
         reason = exc.reason
         if isinstance(reason, ConnectionRefusedError):
-            return (
-                f"Cannot reach Ollama at {base_url}. Start Ollama with `ollama serve`"
-                f"{model_hint}, then retry."
-            )
+            return f"Cannot reach Ollama at {base_url}. Start Ollama with `ollama serve`" f"{model_hint}, then retry."
         if isinstance(reason, socket.timeout):
             return f"Ollama request timed out at {base_url}. Try again or use a smaller model."
 
     if "connection refused" in lowered or "winerror 10061" in lowered:
-        return (
-            f"Cannot reach Ollama at {base_url}. Start Ollama with `ollama serve`"
-            f"{model_hint}, then retry."
-        )
+        return f"Cannot reach Ollama at {base_url}. Start Ollama with `ollama serve`" f"{model_hint}, then retry."
     if "timed out" in lowered:
         return f"Ollama request timed out at {base_url}. Try again or use a smaller model."
 
@@ -160,7 +154,7 @@ CORS(
                 "http://127.0.0.1:3002",
                 "http://localhost:3002",
             ]
-        }
+        },
     },
 )
 
@@ -274,7 +268,7 @@ def _table_roles(
         else:
             # 2. Relationship-based heuristic
             is_from = table in from_tables  # appears as the "many" / FK side
-            is_to = table in to_tables      # appears as the "one" / lookup side
+            is_to = table in to_tables  # appears as the "one" / lookup side
 
             if is_to and not is_from:
                 # Only on the lookup side → dimension (e.g. Gender, AgeGroup, Ethnicity)
@@ -302,12 +296,7 @@ def _key_columns(schema_rows: list[dict[str, Any]]) -> list[dict[str, str]]:
         lower = column.lower()
         if not (table and column):
             continue
-        if (
-            lower.endswith("id")
-            or "key" in lower
-            or "date" in lower
-            or lower in {"id", "pk", "fk"}
-        ):
+        if lower.endswith("id") or "key" in lower or "date" in lower or lower in {"id", "pk", "fk"}:
             key_like.append({"table": table, "column": column, "data_type": dtype})
     return key_like
 
@@ -678,8 +667,7 @@ def _relationship_details_from_rows(relationships_rows: Any) -> list[dict[str, A
 
         if from_card is not None or to_card is not None:
             cardinality = (
-                f"{_readable_enum(from_card, CARDINALITY_MAP, '?')}"
-                f":{_readable_enum(to_card, CARDINALITY_MAP, '?')}"
+                f"{_readable_enum(from_card, CARDINALITY_MAP, '?')}" f":{_readable_enum(to_card, CARDINALITY_MAP, '?')}"
             )
         elif legacy_card is not None:
             cardinality = _readable_enum(legacy_card, CARDINALITY_MAP)
@@ -892,27 +880,19 @@ async def _extract_context_via_mcp(resolved: str) -> dict[str, Any]:
                 # NOTE: The MCP server (pbixray_server.py) now filters internal
                 # tables at the source, so the data returned here is already clean.
                 # We still apply _filter_* as a safety net.
-                tables_text = await _call_tool_text(
-                    session, "get_tables", {}, timeout_sec=required_timeout, optional=False
-                )
-                stats_text = await _call_tool_text(
-                    session, "get_statistics", {}, timeout_sec=required_timeout, optional=False
-                )
+                tables_text = await _call_tool_text(session, "get_tables", {}, timeout_sec=required_timeout, optional=False)
+                stats_text = await _call_tool_text(session, "get_statistics", {}, timeout_sec=required_timeout, optional=False)
                 measures_text = await _call_tool_text(
                     session, "get_dax_measures", {}, timeout_sec=required_timeout, optional=False
                 )
                 dax_columns_text = await _call_tool_text(
                     session, "get_dax_columns", {}, timeout_sec=required_timeout, optional=False
                 )
-                schema_text = await _call_tool_text(
-                    session, "get_schema", {}, timeout_sec=required_timeout, optional=False
-                )
+                schema_text = await _call_tool_text(session, "get_schema", {}, timeout_sec=required_timeout, optional=False)
                 relationships_text = await _call_tool_text(
                     session, "get_relationships", {}, timeout_sec=required_timeout, optional=False
                 )
-                metadata_text = await _call_tool_text(
-                    session, "get_metadata", {}, timeout_sec=optional_timeout, optional=True
-                )
+                metadata_text = await _call_tool_text(session, "get_metadata", {}, timeout_sec=optional_timeout, optional=True)
                 power_query_text = await _call_tool_text(
                     session, "get_power_query", {}, timeout_sec=optional_timeout, optional=True
                 )
@@ -923,9 +903,7 @@ async def _extract_context_via_mcp(resolved: str) -> dict[str, Any]:
                     session, "get_model_summary", {}, timeout_sec=optional_timeout, optional=True
                 )
                 # Dedicated MCP tool for Row-Level Security roles.
-                rls_text = await _call_tool_text(
-                    session, "get_rls_roles", {}, timeout_sec=optional_timeout, optional=True
-                )
+                rls_text = await _call_tool_text(session, "get_rls_roles", {}, timeout_sec=optional_timeout, optional=True)
 
                 tables_data = _mcp_parse_json(tables_text, [])
                 stats_rows = _mcp_parse_json(stats_text, [])
@@ -959,7 +937,9 @@ async def _extract_context_via_mcp(resolved: str) -> dict[str, Any]:
                 tables = _filter_table_names(tables)
                 stats_rows = _filter_rows_by_table_name(stats_rows, ("TableName",))
                 schema_rows = _filter_rows_by_table_name(schema_rows, ("TableName",))
-                relationships_rows = _filter_rows_by_table_name(relationships_rows, ("FromTableName", "ToTableName"), drop_none=True)
+                relationships_rows = _filter_rows_by_table_name(
+                    relationships_rows, ("FromTableName", "ToTableName"), drop_none=True
+                )
                 measures_rows = _filter_rows_by_table_name(measures_rows, ("TableName",))
                 dax_columns_rows = _filter_rows_by_table_name(dax_columns_rows, ("TableName",))
                 power_query_rows = _filter_rows_by_table_name(power_query_rows, ("TableName",))
@@ -1255,10 +1235,7 @@ def _build_pdf_context_from_extracted(payload: dict[str, Any]) -> dict[str, Any]
         "schema": schema_rows,
         "statistics": stats_rows,
         "columns": columns,
-        "power_query": _ensure_list(
-            payload.get("power_query")
-            or documentation.get("power_query")
-        ),
+        "power_query": _ensure_list(payload.get("power_query") or documentation.get("power_query")),
         "table_roles": _ensure_list(data_model.get("table_roles")),
     }
 
@@ -1353,9 +1330,7 @@ def _normalize_patch_measures(raw: Any) -> list[dict[str, str]]:
         measure_name = str(item.get("measure_name") or "").strip()
         dax_expression = str(item.get("dax_expression") or "").strip()
         if not table_name or not measure_name or not dax_expression:
-            raise ValueError(
-                "Each measure requires table_name, measure_name, and dax_expression."
-            )
+            raise ValueError("Each measure requires table_name, measure_name, and dax_expression.")
         out.append(
             {
                 "table_name": table_name,
@@ -1711,11 +1686,17 @@ def iter_ollama_chat_stream(
     )
     _log_flush(
         "[dax]%s ollama POST %s model=%s payload_bytes=%d system_chars=%d user_chars=%d",
-        rid, url, model, len(data), len(system), len(user),
+        rid,
+        url,
+        model,
+        len(data),
+        len(system),
+        len(user),
     )
     _log_flush(
         "[dax]%s blocking on urllib.urlopen() — try: `ollama ps`, `ollama run %s` to warm.",
-        rid, model,
+        rid,
+        model,
     )
     t_connect_start = time.perf_counter()
     hb_sec = float(os.environ.get("DAX_URLOPEN_HEARTBEAT_SEC", "3"))
@@ -1727,7 +1708,8 @@ def iter_ollama_chat_stream(
             elapsed = time.perf_counter() - t_connect_start
             _log_flush(
                 "[dax]%s still inside urlopen after %.1fs — check `ollama ps` / GPU.",
-                rid, elapsed,
+                rid,
+                elapsed,
             )
 
     try:
@@ -1767,7 +1749,9 @@ def iter_ollama_chat_stream(
                     logger.warning("[dax]%s slow readline line=%d blocked_ms=%.1f", rid, line_num, block_ms)
 
                 if not raw:
-                    logger.info("[dax]%s readline eof after %d lines yields=%d chars=%d", rid, line_num, content_yields, total_chars)
+                    logger.info(
+                        "[dax]%s readline eof after %d lines yields=%d chars=%d", rid, line_num, content_yields, total_chars
+                    )
                     break
 
                 line = raw.decode("utf-8", errors="replace").strip()
@@ -1784,7 +1768,9 @@ def iter_ollama_chat_stream(
                 json_ok += 1
 
                 if obj.get("done"):
-                    logger.info("[dax]%s ollama done=true lines=%d yields=%d chars=%d", rid, line_num, content_yields, total_chars)
+                    logger.info(
+                        "[dax]%s ollama done=true lines=%d yields=%d chars=%d", rid, line_num, content_yields, total_chars
+                    )
                     break
 
                 msg = obj.get("message") or {}
@@ -1821,7 +1807,14 @@ def api_dax_generate():
     context = (body.get("context") or "").strip()
     pbix_context = (body.get("pbix_context") or "").strip()
     model = (body.get("model") or os.environ.get("OLLAMA_MODEL", "llama3.2:3b")).strip()
-    logger.info("[dax] req_id=%s begin query_len=%d context_len=%d pbix_context_len=%d model=%s", req_id, len(query), len(context), len(pbix_context), model)
+    logger.info(
+        "[dax] req_id=%s begin query_len=%d context_len=%d pbix_context_len=%d model=%s",
+        req_id,
+        len(query),
+        len(context),
+        len(pbix_context),
+        model,
+    )
     if not query:
         return jsonify({"ok": False, "error": "query is required"}), 400
 
@@ -1949,14 +1942,19 @@ def api_story_generate():
 
     # Validate focus against full client context (before compacting for Ollama).
     if focus and not focus_matches_context(focus_check_text or context_text, focus):
-        return jsonify({
-            "ok": False,
-            "error_type": "invalid_focus",
-            "error": (
-                f"The focus area '{focus}' is not related to this Power BI model. "
-                "Try using table names, column names, or business concepts from your data."
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error_type": "invalid_focus",
+                    "error": (
+                        f"The focus area '{focus}' is not related to this Power BI model. "
+                        "Try using table names, column names, or business concepts from your data."
+                    ),
+                }
             ),
-        }), 400
+            400,
+        )
 
     story_temp = float(os.environ.get("STORY_OLLAMA_TEMPERATURE", "0.2"))
     system_prompt = STORY_RULES

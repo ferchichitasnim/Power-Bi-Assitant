@@ -168,12 +168,7 @@ class DocTemplate(BaseDocTemplate):
 
 
 def _escape_xml(text: str) -> str:
-    return (
-        str(text or "")
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _para(text: str, style: ParagraphStyle) -> Paragraph:
@@ -387,8 +382,13 @@ def _build_cover(story: list[Any], doc: dict[str, Any]) -> None:
     for label, value in meta_data:
         meta_rows.append(
             [
-                Paragraph(f"<b>{_escape_xml(label)}</b>", ParagraphStyle("ml", fontName="Helvetica-Bold", fontSize=9, textColor=TEXT_MED, leading=12)),
-                Paragraph(_escape_xml(value), ParagraphStyle("mv", fontName="Helvetica", fontSize=9, textColor=TEXT_DARK, leading=12)),
+                Paragraph(
+                    f"<b>{_escape_xml(label)}</b>",
+                    ParagraphStyle("ml", fontName="Helvetica-Bold", fontSize=9, textColor=TEXT_MED, leading=12),
+                ),
+                Paragraph(
+                    _escape_xml(value), ParagraphStyle("mv", fontName="Helvetica", fontSize=9, textColor=TEXT_DARK, leading=12)
+                ),
             ]
         )
     meta_table = Table(meta_rows, colWidths=[45 * mm, 100 * mm], rowHeights=[8 * mm] * 4)
@@ -454,7 +454,7 @@ def _build_toc(story: list[Any], sections: list[dict[str, str]]) -> None:
                         ParagraphStyle("tn", fontName="Helvetica-Bold", fontSize=11, textColor=ACCENT, leading=14),
                     ),
                     Paragraph(
-                        f"<b>{_escape_xml(title)}</b><br/><font size=8 color=\"#{TEXT_MED.hexval()[2:]}\">{_escape_xml(desc)}</font>",
+                        f'<b>{_escape_xml(title)}</b><br/><font size=8 color="#{TEXT_MED.hexval()[2:]}">{_escape_xml(desc)}</font>',
                         ParagraphStyle("td", fontName="Helvetica", fontSize=10, textColor=TEXT_DARK, leading=15),
                     ),
                 ]

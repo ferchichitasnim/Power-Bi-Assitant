@@ -88,11 +88,7 @@ def focus_matches_context(context_text: str, focus: str) -> bool:
     if focus_norm and focus_norm in context_lower:
         return True
 
-    focus_words = [
-        w
-        for w in re.findall(r"[a-z0-9]+", focus_lower)
-        if len(w) >= 3 and w not in _FOCUS_STOP_WORDS
-    ]
+    focus_words = [w for w in re.findall(r"[a-z0-9]+", focus_lower) if len(w) >= 3 and w not in _FOCUS_STOP_WORDS]
     if not focus_words:
         return True
 

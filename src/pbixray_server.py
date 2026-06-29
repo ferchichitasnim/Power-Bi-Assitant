@@ -62,7 +62,7 @@ def _filter_table_list(tables):
 
 def _filter_df_by_table_column(df, column_name: str, *, drop_none: bool = False):
     """Filter a pandas DataFrame, removing rows where column_name matches an internal table.
-    
+
     If drop_none=True, also removes rows where the column value is None/NaN/empty.
     This is useful for relationship columns where PBIXRay may store None when the
     target table is an internal auto-generated table.
@@ -71,7 +71,7 @@ def _filter_df_by_table_column(df, column_name: str, *, drop_none: bool = False)
         return df
     if column_name not in df.columns:
         return df
-    
+
     def _should_drop(v):
         s = str(v).strip() if v is not None else ""
         if _is_internal_table(s):
@@ -79,14 +79,14 @@ def _filter_df_by_table_column(df, column_name: str, *, drop_none: bool = False)
         if drop_none and (v is None or s == "" or s.lower() == "none" or s.lower() == "nan"):
             return True
         return False
-    
+
     mask = ~df[column_name].apply(_should_drop)
     return df[mask]
 
 
 def _filter_df_by_multiple_table_columns(df, column_names: list, *, drop_none: bool = False):
     """Filter a DataFrame removing rows where ANY of the given columns is an internal table.
-    
+
     If drop_none=True, also drops rows where any column is None/empty (for relationships
     where PBIXRay may store None as the table name for internal auto-generated tables).
     """
@@ -123,9 +123,11 @@ def secure_tool(*args, **kwargs):
         tool_name = func.__name__
 
         if tool_name in disallowed_tools:
+
             @functools.wraps(func)
             def disabled_tool(*f_args, **f_kwargs):
                 return f"Error: The tool '{tool_name}' has been disabled by the server administrator."
+
             return original_decorator(disabled_tool)
         else:
             return original_decorator(func)
@@ -141,11 +143,13 @@ current_model_path: Optional[str] = None
 
 async def run_model_operation(ctx: Context, operation_name: str, operation_fn, *args, **kwargs):
     import time
+
     start_time = time.time()
     await ctx.info(f"Starting {operation_name}...")
     await ctx.report_progress(0, 100)
 
     try:
+
         def run_operation():
             return operation_fn(*args, **kwargs)
 
@@ -355,31 +359,37 @@ def get_rls_roles(ctx: Context) -> str:
                     rows = value.to_dict(orient="records")
                     if rows:
                         has_rls = True
-                        details.append({
-                            "source": attr,
-                            "count": len(rows),
-                            "entries": rows[:20],
-                        })
+                        details.append(
+                            {
+                                "source": attr,
+                                "count": len(rows),
+                                "entries": rows[:20],
+                            }
+                        )
                     continue
 
                 if isinstance(value, (list, tuple)):
                     if len(value) > 0:
                         has_rls = True
-                        details.append({
-                            "source": attr,
-                            "count": len(value),
-                            "entries": list(value)[:20],
-                        })
+                        details.append(
+                            {
+                                "source": attr,
+                                "count": len(value),
+                                "entries": list(value)[:20],
+                            }
+                        )
                     continue
 
                 if isinstance(value, dict):
                     if len(value) > 0:
                         has_rls = True
-                        details.append({
-                            "source": attr,
-                            "count": len(value),
-                            "entries": value,
-                        })
+                        details.append(
+                            {
+                                "source": attr,
+                                "count": len(value),
+                                "entries": value,
+                            }
+                        )
                     continue
             except Exception:
                 continue
@@ -567,6 +577,7 @@ async def get_relationships(ctx: Context, from_table: str = None, to_table: str 
         return "Error: No Power BI file loaded. Please use load_pbix_file first."
 
     try:
+
         def get_filtered_relationships():
             model = current_model
             relationships = model.relationships
@@ -632,6 +643,7 @@ async def get_table_contents(ctx: Context, table_name: str, filters: str = None,
 
     try:
         import time
+
         start_time = time.time()
 
         if page_size is None:
@@ -740,7 +752,9 @@ async def get_table_contents(ctx: Context, table_name: str, filters: str = None,
         elapsed_time = time.time() - start_time
         if elapsed_time > 1.0:
             if filters:
-                await ctx.info(f"Retrieved filtered data from '{table_name}' ({total_rows} rows after filtering) in {elapsed_time:.2f} seconds")
+                await ctx.info(
+                    f"Retrieved filtered data from '{table_name}' ({total_rows} rows after filtering) in {elapsed_time:.2f} seconds"
+                )
             else:
                 await ctx.info(f"Retrieved data from '{table_name}' ({total_rows} rows) in {elapsed_time:.2f} seconds")
 
@@ -860,9 +874,7 @@ async def get_model_summary(ctx: Context) -> str:
         dax_measures = current_model.dax_measures
         if hasattr(dax_measures, "columns") and "TableName" in dax_measures.columns:
             dax_measures = _filter_df_by_table_column(dax_measures, "TableName")
-        summary["measures_count"] = (
-            len(dax_measures) if hasattr(dax_measures, "__len__") else "Unknown"
-        )
+        summary["measures_count"] = len(dax_measures) if hasattr(dax_measures, "__len__") else "Unknown"
 
         await ctx.report_progress(75, 100)
 
@@ -872,9 +884,7 @@ async def get_model_summary(ctx: Context) -> str:
             relationships = _filter_df_by_multiple_table_columns(
                 relationships, ["FromTableName", "ToTableName"], drop_none=True
             )
-        summary["relationships_count"] = (
-            len(relationships) if hasattr(relationships, "__len__") else "Unknown"
-        )
+        summary["relationships_count"] = len(relationships) if hasattr(relationships, "__len__") else "Unknown"
 
         await ctx.report_progress(100, 100)
 

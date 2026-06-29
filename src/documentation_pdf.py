@@ -30,6 +30,7 @@ def _pdf_ollama_model() -> str:
         return explicit
     return DEFAULT_MODEL
 
+
 CARDINALITY_MAP = {0: "None", 1: "One", 2: "Many"}
 DIRECTION_MAP = {1: "Single", 2: "Both", 3: "Automatic"}
 
@@ -271,16 +272,10 @@ def detect_schema_type(
         )
     elif dim_to_dim > 0:
         schema_type = "Snowflake"
-        explanation = (
-            f"Schéma en flocon : {dim_to_dim} lien(s) entre dimensions "
-            "(sous-dimensions en chaîne)."
-        )
+        explanation = f"Schéma en flocon : {dim_to_dim} lien(s) entre dimensions " "(sous-dimensions en chaîne)."
     elif len(fact_tables) == 1:
         schema_type = "Étoile"
-        explanation = (
-            f"Schéma en étoile : {fact_tables[0]} (faits) reliée à "
-            f"{len(dimension_tables)} dimension(s)."
-        )
+        explanation = f"Schéma en étoile : {fact_tables[0]} (faits) reliée à " f"{len(dimension_tables)} dimension(s)."
     else:
         schema_type = "Inconnu"
         explanation = "Structure relationnelle non classifiable automatiquement."
@@ -322,9 +317,7 @@ def _columns_by_table(payload: dict[str, Any]) -> dict[str, list[str]]:
             if isinstance(cols, list):
                 for c in cols:
                     if isinstance(c, dict):
-                        out.setdefault(str(table), []).append(
-                            str(c.get("Name") or c.get("name") or c.get("ColumnName") or "")
-                        )
+                        out.setdefault(str(table), []).append(str(c.get("Name") or c.get("name") or c.get("ColumnName") or ""))
                     else:
                         out.setdefault(str(table), []).append(str(c))
 
@@ -689,12 +682,7 @@ def _normalize_relationship_row(row: dict[str, Any]) -> dict[str, Any] | None:
 
 def _rls_row_from_dict(item: dict[str, Any]) -> dict[str, str] | None:
     role = str(
-        item.get("role")
-        or item.get("Role")
-        or item.get("RoleName")
-        or item.get("name")
-        or item.get("Name")
-        or ""
+        item.get("role") or item.get("Role") or item.get("RoleName") or item.get("name") or item.get("Name") or ""
     ).strip()
     table = str(
         item.get("table")
@@ -791,13 +779,7 @@ def prepare_pdf_context(payload: dict[str, Any]) -> dict[str, Any]:
     """Build structured context from raw PBIX documentation payload."""
     filename = str(payload.get("filename") or "PowerBI_Documentation.pbix")
     tables_raw = _to_list(payload.get("tables"))
-    business_tables = sorted(
-        {
-            _table_name(t)
-            for t in tables_raw
-            if _table_name(t) and not _is_internal_table(_table_name(t))
-        }
-    )
+    business_tables = sorted({_table_name(t) for t in tables_raw if _table_name(t) and not _is_internal_table(_table_name(t))})
 
     rels_raw = _to_list(payload.get("relationships"))
     business_rels: list[dict[str, Any]] = []
@@ -817,11 +799,7 @@ def prepare_pdf_context(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         table = str(m.get("table") or m.get("TableName") or "").strip()
         formula = str(
-            m.get("formula")
-            or m.get("Expression")
-            or m.get("expression")
-            or m.get("MeasureExpression")
-            or ""
+            m.get("formula") or m.get("Expression") or m.get("expression") or m.get("MeasureExpression") or ""
         ).strip()
         measures.append(
             {
@@ -958,10 +936,7 @@ def enrich_documentation_json(ctx: dict[str, Any]) -> dict[str, Any]:
 
     # Re-check duplicate measure descriptions; optional LLM fix for stragglers
     measure_descs = merged.get("measure_descriptions") or {}
-    biz: dict[str, str] = {
-        n: (v.get("business_desc") if isinstance(v, dict) else str(v))
-        for n, v in measure_descs.items()
-    }
+    biz: dict[str, str] = {n: (v.get("business_desc") if isinstance(v, dict) else str(v)) for n, v in measure_descs.items()}
     inv: dict[str, list[str]] = {}
     for n, d in biz.items():
         if d:
@@ -1243,9 +1218,7 @@ def _fallback_audit(ctx: dict[str, Any]) -> dict[str, Any]:
         f"Source de données unique ({ctx.get('data_source_label', 'détectée')}) simplifiant la gouvernance",
     ]
     if ctx.get("calculated_columns"):
-        strengths.append(
-            f"{k['calculated_columns']} colonnes calculées pour conversions de devises et montants normalisés"
-        )
+        strengths.append(f"{k['calculated_columns']} colonnes calculées pour conversions de devises et montants normalisés")
     if ctx.get("rls_rows"):
         strengths.append("RLS configuré pour le contrôle d'accès par utilisateur")
 
@@ -1330,19 +1303,14 @@ def _merge_measure_groups(ctx: dict[str, Any], llm: dict[str, Any]) -> dict[str,
         name = measure["name"]
         llm_m = desc_map.get(name) if isinstance(desc_map.get(name), dict) else {}
         domain = str(llm_m.get("domain") or measure.get("domain") or "Autres Mesures")
-        business_desc = str(
-            llm_m.get("business_desc")
-            or describe_measure_from_name_and_dax(name, measure.get("formula", ""))
-        )
+        business_desc = str(llm_m.get("business_desc") or describe_measure_from_name_and_dax(name, measure.get("formula", "")))
         dax_logic = str(
             llm_m.get("dax_logic")
             or describe_measure_dax_logic(name, measure.get("formula", ""))
             or measure.get("dax_logic")
             or "—"
         )
-        groups.setdefault(domain, []).append(
-            {"name": name, "business_desc": business_desc, "dax_logic": dax_logic}
-        )
+        groups.setdefault(domain, []).append({"name": name, "business_desc": business_desc, "dax_logic": dax_logic})
 
     domain_order = [d[0] for d in MEASURE_DOMAIN_RULES] + ["Autres Mesures"]
     ordered: dict[str, list[dict[str, str]]] = {}
@@ -1382,10 +1350,7 @@ def assemble_reportlab_document(ctx: dict[str, Any], llm: dict[str, Any]) -> dic
         desc = str(table_desc.get(name) or describe_table_from_columns(name, cols))
         dim_tables.append([name, str(len(cols)), desc])
 
-    rel_rows = [
-        [r["from"], r["to"], r["cardinality"], r["direction"], r["active"], r["remark"]]
-        for r in ctx["relationships"]
-    ]
+    rel_rows = [[r["from"], r["to"], r["cardinality"], r["direction"], r["active"], r["remark"]] for r in ctx["relationships"]]
 
     calc_desc = llm.get("calc_column_descriptions") if isinstance(llm.get("calc_column_descriptions"), dict) else {}
     if not calc_desc and isinstance(ctx.get("enrichment"), dict):
@@ -1400,10 +1365,7 @@ def assemble_reportlab_document(ctx: dict[str, Any], llm: dict[str, Any]) -> dic
         )
         calc_rows.append([col["table"], col["name"], col["expression_short"], desc])
 
-    rls_rows = [
-        [r["role"], r["table"], r["expression"], r["description"]]
-        for r in ctx["rls_rows"]
-    ]
+    rls_rows = [[r["role"], r["table"], r["expression"], r["description"]] for r in ctx["rls_rows"]]
 
     audit = llm.get("audit") if isinstance(llm.get("audit"), dict) else {}
     fallback_audit = _fallback_audit(ctx)
@@ -1517,10 +1479,7 @@ def assemble_reportlab_document(ctx: dict[str, Any], llm: dict[str, Any]) -> dic
             )
             data["rows"] = calc_rows
         elif key == "rls":
-            data["intro"] = str(
-                llm.get("rls_intro")
-                or f"Le modèle contient <b>{len(rls_rows)} rôle(s) RLS</b>."
-            )
+            data["intro"] = str(llm.get("rls_intro") or f"Le modèle contient <b>{len(rls_rows)} rôle(s) RLS</b>.")
             data["rows"] = rls_rows
             data["info"] = str(llm.get("rls_info") or "")
         elif key == "audit":
